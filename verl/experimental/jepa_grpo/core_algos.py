@@ -436,3 +436,155 @@ def llm_jepa_clreg_loss(
         metrics["jepa/hard_neg_ew_variance"] = 0.0
 
     return loss, metrics
+
+
+# ---------------------------------------------------------------------------
+# TCR (Teacher-Correct Representation) loss: align-to-teacher + SIGReg
+# ---------------------------------------------------------------------------
+
+def llm_jepa_tcr_loss(
+    pred_text: torch.Tensor,          # (A, d) p_i = Pred(Enc(student CoT_i)), L2-normalized
+    teacher_target: torch.Tensor,     # (A, d) z_T+ paired to anchor i (precomputed, constant), L2-normalized
+    all_pool: torch.Tensor,           # (A, d) SIGReg pool — STUDENT preds only (the only thing that moves)
+    group_id: torch.Tensor | None = None,    # (A,) long: per-prompt id (0..G-1) for each anchor
+    is_correct: torch.Tensor | None = None,  # (A,) bool: True for rew>0 anchors
+    lambda_: float = 0.5,
+    M: int = 1024,
+    n_freq: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    s: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Teacher-Correct Representation (TCR) alignment loss.
+
+    L = (1-λ)·L_align + λ·L_SIGReg,  ℓ_i = 1 - <p_i, sg(z_T+_i)>
+
+    Each anchor p_i = Pred(Enc([x, y_S,i, [PRED]xk])) is pulled toward a precomputed
+    teacher-correct target z_T+_i in the SAME 1536-d student space (teacher text encoded
+    offline by a frozen student-size reference — no projector, no cross-dim cosine).
+    Correct AND wrong rollouts may be anchors (jepa.jepa_anchor_set): for wrong anchors the
+    [PRED] token learns to predict the teacher-correct latent from a failed trajectory's
+    context (latent correction), without forcing the wrong response's own hidden state to
+    look correct.
+
+    ANCHOR AGGREGATION (when group_id/is_correct are given) is reward-stratified and
+    PROMPT-averaged, so raw anchor counts never implicitly weight the loss:
+
+        L(x) = ½·mean_{i∈C_x} ℓ_i + ½·mean_{i∈W_x} ℓ_i   if both correct & wrong present
+             = mean over whichever conditional set is non-empty otherwise
+             = 0                                          if the prompt has no anchors
+        L_align = (1/G) Σ_x L(x)                          # mean over prompts, not anchors
+
+    The fixed ½/½ split defines a reward-stratified anchor distribution; it is NOT a tunable
+    per-class loss weight. With group_id/is_correct=None this falls back to the flat
+    (1/A) Σ ℓ_i used before the wrong-anchor extension.
+
+    NOTE on jepa_anchor_set="correct": this mode now uses the prompt-averaged correct-anchor
+    loss (mean over prompts of each prompt's mean correct ℓ), which can differ NUMERICALLY
+    from the old flat (1/A) Σ ℓ_i whenever prompts have unequal numbers of correct anchors.
+    This is intentional: prompt-level averaging stops prompts that happen to sample many
+    correct rollouts from dominating the representation objective. The flat mean survives only
+    as the group_id/is_correct=None back-compat path (never hit in normal training, since the
+    batch builder always supplies these tensors).
+
+    STOP-GRADIENT on the teacher target (cached constant; ``.detach()`` is explicit). No
+    separation term — SIGReg over the student preds alone supplies anti-collapse, keeping the
+    global-radius rescale that is load-bearing on unit-sphere inputs (see sigreg_loss).
+    """
+    A = pred_text.shape[0]
+    device, dtype = pred_text.device, pred_text.dtype
+
+    # Defensive empty-batch guard: SIGReg over an empty pool is undefined (NaN), so
+    # short-circuit to a finite zero loss with zeroed metrics. Normal training never
+    # reaches here (the batch builder + worker both skip below min_valid_pairs).
+    if A == 0:
+        zero = torch.zeros((), device=device, dtype=dtype)
+        metrics = {
+            "jepa/tcr_align_loss": 0.0, "jepa/tcr_sigreg_loss": 0.0, "jepa/tcr_loss": 0.0,
+            "jepa/llm_jepa_loss": 0.0, "jepa/tcr_lambda": float(lambda_), "jepa/n_anchors": 0,
+            "jepa/tcr_pos_score_mean": 0.0, "jepa/pool_size": int(all_pool.shape[0]),
+            "jepa/num_anchors_total": 0, "jepa/num_anchors_correct": 0, "jepa/num_anchors_wrong": 0,
+            "jepa/loss_align": 0.0, "jepa/loss_correct_monitor": 0.0, "jepa/loss_wrong_monitor": 0.0,
+            "jepa/cos_total": 0.0, "jepa/cos_correct": 0.0, "jepa/cos_wrong": 0.0,
+        }
+        return zero, metrics
+
+    # ℓ_i: cosine distance to the stop-gradiented teacher target.
+    pos_sim = (pred_text * teacher_target.detach()).sum(dim=-1)   # (A,)
+    ell = 1.0 - pos_sim                                           # (A,)
+
+    if group_id is None or is_correct is None:
+        # Back-compat flat mean over all anchors.
+        align = ell.mean()
+    else:
+        # Reward-stratified, prompt-averaged aggregation.
+        gid = group_id.to(device=device, dtype=torch.long)
+        corr = is_correct.to(device=device, dtype=torch.bool)
+        G = int(gid.max().item()) + 1 if A > 0 else 0
+        ones = torch.ones(A, device=device, dtype=dtype)
+
+        def _group_mean(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # Per-group mean of ℓ over the masked subset; returns (mean_g, present_g).
+            m = mask.to(dtype)
+            ssum = torch.zeros(G, device=device, dtype=dtype).index_add_(0, gid, ell * m)
+            cnt = torch.zeros(G, device=device, dtype=dtype).index_add_(0, gid, ones * m)
+            present = cnt > 0
+            mean_g = ssum / cnt.clamp(min=1.0)
+            return mean_g, present
+
+        cmean, cpresent = _group_mean(corr)
+        wmean, wpresent = _group_mean(~corr)
+        both = cpresent & wpresent
+        # ½/½ where both classes exist, else the single available conditional mean.
+        per_prompt = torch.where(both, 0.5 * cmean + 0.5 * wmean,
+                                 torch.where(cpresent, cmean, wmean))
+        any_anchor = cpresent | wpresent
+        n_prompts = any_anchor.sum().clamp(min=1)
+        align = (per_prompt * any_anchor.to(dtype)).sum() / n_prompts
+
+    sig = sigreg_loss(all_pool, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
+
+    loss = (1.0 - lambda_) * align + lambda_ * sig
+
+    # ---- monitor-only stats (do NOT affect the optimized loss) ----
+    pos_sim_d = pos_sim.detach()
+    ell_d = ell.detach()
+    if is_correct is not None and A > 0:
+        corr = is_correct.to(device=device, dtype=torch.bool)
+        n_correct = int(corr.sum().item())
+        n_wrong = A - n_correct
+        cos_correct = float(pos_sim_d[corr].mean().cpu()) if n_correct > 0 else 0.0
+        cos_wrong = float(pos_sim_d[~corr].mean().cpu()) if n_wrong > 0 else 0.0
+        loss_correct_monitor = float(ell_d[corr].mean().cpu()) if n_correct > 0 else 0.0
+        loss_wrong_monitor = float(ell_d[~corr].mean().cpu()) if n_wrong > 0 else 0.0
+    else:
+        n_correct, n_wrong = A, 0
+        cos_correct = float(pos_sim_d.mean().cpu()) if A > 0 else 0.0
+        cos_wrong = 0.0
+        loss_correct_monitor = float(ell_d.mean().cpu()) if A > 0 else 0.0
+        loss_wrong_monitor = 0.0
+
+    # Single host transfer for the repeated full-pool means (avoid one .cpu() per use).
+    align_v = float(align.detach().cpu())
+    pos_mean_v = float(pos_sim_d.mean().cpu()) if A > 0 else 0.0
+    metrics = {
+        "jepa/tcr_align_loss": align_v,
+        "jepa/tcr_sigreg_loss": float(sig.detach().cpu()),
+        "jepa/tcr_loss": float(loss.detach().cpu()),       # full optimized JEPA-side scalar
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),  # alias read back by worker
+        "jepa/tcr_lambda": float(lambda_),
+        "jepa/n_anchors": int(A),
+        "jepa/tcr_pos_score_mean": pos_mean_v,
+        "jepa/pool_size": int(all_pool.shape[0]),
+        # reward-stratified monitoring (monitor-only — NOT separately weighted in the loss)
+        "jepa/num_anchors_total": int(A),
+        "jepa/num_anchors_correct": int(n_correct),
+        "jepa/num_anchors_wrong": int(n_wrong),
+        "jepa/loss_align": align_v,            # the (prompt-averaged) alignment term only
+        "jepa/loss_correct_monitor": loss_correct_monitor,
+        "jepa/loss_wrong_monitor": loss_wrong_monitor,
+        "jepa/cos_total": pos_mean_v,
+        "jepa/cos_correct": cos_correct,
+        "jepa/cos_wrong": cos_wrong,
+    }
+    return loss, metrics

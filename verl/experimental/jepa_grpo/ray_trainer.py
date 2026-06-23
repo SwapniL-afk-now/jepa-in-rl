@@ -24,6 +24,7 @@ on the actor worker itself so gradients are never shipped over Ray.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections import defaultdict
 from typing import Any
@@ -38,6 +39,8 @@ from verl.trainer.ppo.metric_utils import compute_data_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler.performance import simple_timer
+
+logger = logging.getLogger(__name__)
 
 
 class JEPARayPPOTrainer(RayPPOTrainer):
@@ -60,6 +63,16 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         super().__init__(*args, **kwargs)
         self.jepa_cfg = JEPARayConfig.from_config(self.config.get("jepa", {}))
         self.jepa_cfg.validate(self.config.actor_rollout_ref.rollout.n)
+
+        # jepa-tcr-loss: load the offline teacher-target cache once. Keyed by the
+        # dataset row index (extra_info["index"]); each value is a (n_i, d) tensor
+        # of L2-normalized teacher-correct target embeddings in student space.
+        self.teacher_targets: dict[int, torch.Tensor] | None = None
+        if self.jepa_cfg.enable and self.jepa_cfg.loss_type == "jepa-tcr-loss":
+            raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
+            self.teacher_targets = {
+                int(k): v.float() for k, v in raw.items() if v is not None and v.numel() > 0
+            }
 
     # ------------------------------------------------------ worker setup ----
     def init_workers(self):
@@ -582,6 +595,138 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         jepa_batch.meta_info["n_wrong"] = W
         return jepa_batch
 
+    def _build_jepa_batch_tcr(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        view_tags: np.ndarray,
+    ) -> DataProto | None:
+        """Build the jepa-tcr-loss batch: CoT-only correct student anchors, each
+        paired with a PRECOMPUTED teacher-correct target embedding.
+
+        Unlike the clreg/separation builders this has a single block:
+          - cot block: every CORRECT CoT rollout (rew>0) of every prompt whose
+            dataset index has cached teacher targets is an anchor. Code/wrong
+            rollouts are ignored entirely (the teacher target replaces e^c, and
+            there is no separation term).
+          - teacher_target block: a (A, d) float tensor aligned 1:1 to the anchor
+            rows, drawn from this prompt's cached targets `Z_u` (n_u, d) by either
+            cycle (`j % n_u`) or random matching (jepa.tcr_match).
+
+        Prompts with no cached teacher targets contribute no anchors (their JEPA
+        signal is simply absent). Returns None if fewer than min_valid_pairs
+        anchors exist (worker also guards via min_valid_pairs).
+        """
+        assert self.teacher_targets is not None, "teacher target cache not loaded"
+        uids = batch.non_tensor_batch["uid"]
+        extra_infos = batch.non_tensor_batch["extra_info"]
+        rew = reward_tensor.sum(dim=-1)
+
+        all_input_ids = batch.batch["input_ids"]
+        all_attn_mask = batch.batch["attention_mask"]
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        # Group correct CoT rows by uid, preserving first-seen order. Record each
+        # uid's dataset index so we can look its teacher targets up in the cache.
+        cot_by_uid: dict = defaultdict(list)
+        idx_by_uid: dict = {}
+        for i, (u, v) in enumerate(zip(uids, view_tags)):
+            if v != "cot":
+                continue
+            cot_by_uid[u].append(i)
+            if u not in idx_by_uid:
+                info = extra_infos[i]
+                idx_by_uid[u] = int(info["index"]) if isinstance(info, dict) else None
+
+        anchor_set = self.jepa_cfg.jepa_anchor_set
+        cot_ids_list, cot_lengths, target_list = [], [], []
+        group_id_list, is_correct_list = [], []
+        n_correct_cot_list = []
+        group_counter = 0
+        for u in dict.fromkeys(uids):  # dedup, preserves first-seen order
+            ds_idx = idx_by_uid.get(u)
+            targets = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
+            if targets is None or targets.numel() == 0:
+                continue
+            # Select anchors by reward according to jepa_anchor_set. All anchors share the
+            # identical [x, y_S, [PRED]] format and predict the teacher-correct target.
+            cot_idxs = cot_by_uid.get(u, [])
+            if anchor_set == "correct":
+                selected = [i for i in cot_idxs if rew[i] > 0]
+            elif anchor_set == "wrong":
+                selected = [i for i in cot_idxs if rew[i] <= 0]
+            else:  # "all"
+                selected = list(cot_idxs)
+            # Defensive: drop degenerate zero-length rows (would yield a zero embedding
+            # in the encoder and pollute the stratified means). Normal rollouts always
+            # carry the prompt, so this is just a safety net.
+            selected = [i for i in selected if int(all_attn_mask[i].sum()) > 0]
+            if not selected:
+                continue
+            n_u = targets.shape[0]
+            n_correct_cot_list.append(sum(1 for i in selected if rew[i] > 0))
+            gid = group_counter
+            group_counter += 1
+            for j, cot_idx in enumerate(selected):
+                ids = all_input_ids[cot_idx][all_attn_mask[cot_idx].bool()]
+                cot_ids_list.append(ids)
+                cot_lengths.append(int(all_attn_mask[cot_idx].sum()))
+                if self.jepa_cfg.tcr_match == "random":
+                    t_row = int(torch.randint(n_u, (1,)).item())
+                else:  # cycle
+                    t_row = j % n_u
+                target_list.append(targets[t_row])
+                group_id_list.append(gid)
+                is_correct_list.append(bool(rew[cot_idx] > 0))
+
+        A = len(cot_ids_list)
+        if A < self.jepa_cfg.min_valid_pairs:
+            return None
+
+        max_len = max(s.shape[0] for s in cot_ids_list)
+        cot_padded_ids = torch.stack([
+            torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in cot_ids_list
+        ])
+        cot_padded_mask = torch.stack([
+            torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
+            for length in cot_lengths
+        ])
+        teacher_target = torch.nn.functional.normalize(torch.stack(target_list, dim=0).float(), dim=-1)
+
+        jepa_batch = DataProto.from_single_dict({
+            "cot_input_ids": cot_padded_ids,
+            "cot_attn_mask": cot_padded_mask,
+            "cot_lengths": torch.tensor(cot_lengths, dtype=torch.long),
+            "teacher_target": teacher_target,
+            "anchor_group_id": torch.tensor(group_id_list, dtype=torch.long),
+            "anchor_is_correct": torch.tensor(is_correct_list, dtype=torch.bool),
+        })
+        jepa_batch.meta_info["n_correct_cot_mean"] = float(np.mean(n_correct_cot_list)) if n_correct_cot_list else 0.0
+        jepa_batch.meta_info["n_anchors"] = A
+        return jepa_batch
+
+    # ------------------------------------------------ memory diagnostics -----
+    @staticmethod
+    def _log_gpu_mem(tag: str) -> None:
+        """Log device-level GPU memory (used/total MiB) at a phase boundary.
+
+        Uses `nvidia-smi` rather than torch so the driver process does NOT create
+        a CUDA context (which would itself consume GPU memory on this memory-tight
+        colocated setup). Device-level used memory captures BOTH the vLLM EngineCore
+        and the FSDP-actor worker processes. Best-effort: never raises into the loop.
+        """
+        try:
+            import subprocess
+
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            logger.info("[jepa-gpu-mem] %s: %s MiB (used,total per GPU)", tag, out.replace("\n", " | "))
+        except Exception as e:  # noqa: BLE001 - diagnostics must never break training
+            logger.warning("[jepa-gpu-mem] %s: snapshot failed (%s)", tag, e)
+
     # ---------------------------------------------------- training loop -----
     def fit(self):
         """JEPA-GRPO training loop.
@@ -744,17 +889,39 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         config=self.config.algorithm,
                     )
 
+                # Sleep rollout replicas BEFORE old_log_prob so vLLM releases its KV
+                # reservation before the actor recomputes log-probs (the ~7 GiB lm_head
+                # logits block). Previously the sleep sat AFTER old_log_prob, so that block
+                # was allocated while vLLM still held its full KV pool -> OOM near the card
+                # ceiling (logs: "Tried to allocate 6.90 GiB ... 92.14 GiB in use").
+                # Called exactly once per step; vLLM is woken again only at weight_sync_2.
+                #
+                # DRAIN GUARD: issuing a vLLM RPC (sleep_replicas IS one) immediately after
+                # generate_sequences() reproducibly segfaults vLLM's executor when there is no
+                # real wall-clock gap (see the same-class issue + _time.sleep(5) guard in the
+                # Step-1 cot/code generation block). The old ordering was safe only because
+                # old_log_prob (~14 s of FSDP work) sat between generation and the sleep; the
+                # reward/advantage block above is only ~15 ms, so we reinstate the documented
+                # short drain before the sleep RPC.
+                self._log_gpu_mem("after_gen_before_sleep")
+                import time as _time
+                _time.sleep(5)
+                with simple_timer("sleep_replicas_1", timing_raw):
+                    self.checkpoint_manager.sleep_replicas()
+                self._log_gpu_mem("after_sleep")
+
                 # ── Step 3: Compute old log-probs & (optional) ref ──────
+                # Actor/FSDP-only (compute_log_prob); does NOT call vLLM. All rollout outputs
+                # it reads are already materialized in `batch` (DataProto.concat in Step 1),
+                # so sleeping vLLM first is safe.
+                self._log_gpu_mem("before_old_log_prob")
                 with simple_timer("old_log_prob", timing_raw):
                     old_log_prob, _old_log_prob_mfu = self._compute_old_log_prob(batch)
                     batch = batch.union(old_log_prob)
                     if self.use_reference_policy:
                         ref_log_prob = self._compute_ref_log_prob(batch)
                         batch = batch.union(ref_log_prob)
-
-                # Sleep rollout replicas before backward (frees KV cache)
-                with simple_timer("sleep_replicas_1", timing_raw):
-                    self.checkpoint_manager.sleep_replicas()
+                self._log_gpu_mem("after_old_log_prob")
 
                 # ── Step 4: GRPO actor update ────────────────────────────
                 with simple_timer("update_actor", timing_raw):
@@ -781,7 +948,13 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                         # Both supported loss_types use a 3-view (cot/code/clean-wrong)
                         # builder; clreg (v3) collects ALL anchors/wrongs per group
                         # with group ids, the hinge mode one matched triplet per group.
-                        if self.jepa_cfg.loss_type == "jepa-clreg-loss":
+                        if self.jepa_cfg.loss_type == "jepa-tcr-loss":
+                            jepa_batch = self._build_jepa_batch_tcr(
+                                batch=batch,
+                                reward_tensor=reward_tensor,
+                                view_tags=view_tags,
+                            )
+                        elif self.jepa_cfg.loss_type == "jepa-clreg-loss":
                             jepa_batch = self._build_jepa_batch_clreg(
                                 batch=batch,
                                 reward_tensor=reward_tensor,
@@ -834,8 +1007,10 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 metrics["code/avg_reward"] = float(code_rew_scalar.mean()) if len(code_rew_scalar) else 0.0
 
                 # ── Step 6: Weight sync to rollout (wakes vLLM) ─────────
+                self._log_gpu_mem("before_weight_sync_2")
                 with simple_timer("weight_sync_2", timing_raw):
                     self.checkpoint_manager.update_weights(self.global_steps)
+                self._log_gpu_mem("after_weight_sync_2")
 
                 # ── CoT-based train metrics (rich grouped stats) ─────────
                 cot_rew_scalar = rew_scalar_all[torch.from_numpy(cot_mask_rows)]
