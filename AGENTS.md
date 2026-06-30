@@ -1,5 +1,10 @@
 # Agent Instructions for verl
 
+> **Setting up this project on a fresh server? Read [`REPRODUCE.md`](REPRODUCE.md) first** —
+> environment, directory layout, which HF repos hold the models/datasets/teacher-caches,
+> and how to run training + evaluation. The rest of this file is the upstream verl
+> contribution policy.
+
 > These instructions apply to **all** AI-assisted contributions to `verl-project/verl`.
 > Breaching these guidelines can result in automatic banning.
 
