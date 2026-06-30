@@ -130,7 +130,34 @@ python eval_code_benchmarks.py --model /workspace/models/framework \
 
 ---
 
-## 6. Output: ICLR paper
+## 6. Workflow conventions
+
+How work is run and reported on this project (carried over from the original machine's
+local instructions; follow these unless the user says otherwise):
+
+- **tmux, never foreground.** Launch long jobs (training, eval sweeps) in a tmux session
+  and detach — `tmux send-keys -t <session> "<cmd>" Enter`. Status checks should be quick:
+  capture the pane + `nvidia-smi` and report progress/ETA tersely. On this server the
+  convention was: **training → `jepa` session, eval/benchmarks → `dapo-jepa` session** (a
+  fresh server can use any names — the point is detached + reattachable, not blocking).
+- **Single GPU, sequential.** Schedule jobs one at a time; each python frees the GPU on
+  exit. Poll with a `wait_gpu()` loop (`nvidia-smi memory.used < 5000 MiB`) between steps.
+  `send-keys` sent while a prior job's vLLM/Ray engine is still shutting down gets silently
+  eaten — wait until the GPU is truly free AND the prompt is idle.
+- **After a run: push artifacts to HuggingFace, then clean local disk.** Models →
+  `swapnil7777/framework` (ours) / `swapnil7777/dapo-baseline`; datasets/caches →
+  `swapnil7777/framework-teacher-cache`. Push uploads in the background (bandwidth-limited
+  ~3.7 MB/s, not hung).
+- **Code pushes → the `jepa-in-rl` git remote**, not `origin`.
+- **Be direct and concise.** Short answers, tables for results, no preamble/filler.
+- **Honesty + root-cause over acceptance.** When a result looks wrong, investigate the
+  mechanism (e.g. truncation of verbose CoT before the code fence closes) — don't just
+  accept or bury it. Report failures and caveats plainly. Put results in the paper with
+  exact numbers and the right seeds; don't average old+new seed sets.
+
+---
+
+## 7. Output: ICLR paper
 
 Results feed `/workspace/paper/iclr2025_conference.tex` (+ `iclr2026_*`). LaTeX format
 for a result: `$VAL${\scriptsize$\,\pm X.X$}`. Put exact numbers, right seeds, honest
