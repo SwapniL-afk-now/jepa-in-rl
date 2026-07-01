@@ -298,7 +298,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         device = next(self.actor.engine.module.parameters()).device
         N = input_ids.shape[0]
-        rlens = [int(seq_lengths[b].item()) for b in range(N)]
+        rlens = seq_lengths.long().tolist()  # one host sync instead of N .item() calls
         if isinstance(predictor_k, int):
             predictor_ks = [predictor_k] * N
         else:
@@ -355,7 +355,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         finally:
             handle.remove()
 
-        last_h = captured["h"].float()   # (N, max_rlen, d)
+        last_h = captured["h"]   # (N, max_rlen, d) — kept in model dtype; only the
+        # gathered read positions are cast to float32 below (the old full-tensor
+        # .float() materialized an extra (N, max_rlen, d) fp32 copy per forward).
 
         # Keep a zero-valued scalar connected to the model's returned logits.
         # This forces backward to flow through the model's actual output tensor,
@@ -366,28 +368,25 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         # The multiplier is exactly 0.0 so this contributes zero gradient.
         logits_anchor = outputs.logits[:, 0, 0].sum() * 0.0
 
-        all_embs = []
-        boundary_embs = [] if also_boundary else None
-        for b, rlen in enumerate(rlens):
-            if rlen == 0:
-                all_embs.append(torch.zeros(last_h.shape[-1], device=device))
-                if also_boundary:
-                    boundary_embs.append(torch.zeros(last_h.shape[-1], device=device))
-            else:
-                # With predictor_ks[b]=0 this is rlen-1 (last real token),
-                # matching prior behavior exactly. With predictor_ks[b]>0, this
-                # reads that row's last predictor token = Pred(Enc(Text)).
-                last_idx = rlen + predictor_ks[b] - 1
-                emb = torch.nn.functional.normalize(last_h[b, last_idx, :], dim=-1)
-                all_embs.append(emb)
-                if also_boundary:
-                    # Boundary = last REAL token (pre-[PRED]); equals `emb` when k=0.
-                    bnd = torch.nn.functional.normalize(last_h[b, rlen - 1, :], dim=-1)
-                    boundary_embs.append(bnd)
+        # Vectorized gather of the per-row read positions (replaces the per-row
+        # Python loop). With predictor_ks[b]=0 the read is rlen-1 (last real
+        # token); with predictor_ks[b]>0 it is that row's last predictor token
+        # = Pred(Enc(Text)). Rows with rlen==0 get a zero embedding, as before.
+        rlen_t = torch.tensor(rlens, device=device, dtype=torch.long)
+        pk_t = torch.tensor(predictor_ks, device=device, dtype=torch.long)
+        rows = torch.arange(N, device=device)
+        empty = (rlen_t == 0).unsqueeze(-1)
+        read_idx = (rlen_t + pk_t - 1).clamp(min=0)
+        emb = torch.nn.functional.normalize(last_h[rows, read_idx].float(), dim=-1)
+        emb = torch.where(empty, torch.zeros_like(emb), emb)
 
         if also_boundary:
-            return torch.stack(all_embs, dim=0), torch.stack(boundary_embs, dim=0), logits_anchor
-        return torch.stack(all_embs, dim=0), logits_anchor  # (N, d), scalar
+            # Boundary = last REAL token (pre-[PRED]); equals `emb` when k=0.
+            bnd_idx = (rlen_t - 1).clamp(min=0)
+            bnd = torch.nn.functional.normalize(last_h[rows, bnd_idx].float(), dim=-1)
+            bnd = torch.where(empty, torch.zeros_like(bnd), bnd)
+            return emb, bnd, logits_anchor
+        return emb, logits_anchor  # (N, d), scalar
 
     def _embed_chunked_no_grad(
         self,
@@ -412,24 +411,39 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         N = ids.shape[0]
         per_row_k = isinstance(predictor_k, (list, tuple))
 
-        def _k(start, end):
-            return list(predictor_k[start:end]) if per_row_k else predictor_k
-
         if N <= micro_bs:
             emb, _ = self._extract_embeddings(
                 ids, mask, lengths, use_ema=use_ema, requires_grad=False,
-                predictor_k=_k(0, N), predictor_token_id=predictor_token_id,
+                predictor_k=(list(predictor_k) if per_row_k else predictor_k),
+                predictor_token_id=predictor_token_id,
             )
             return emb
+
+        # Sort rows by length before chunking so each chunk is padded to ITS OWN
+        # max length instead of (in expectation) the global max — with skewed
+        # response lengths this cuts the padded FLOPs of every chunk forward
+        # substantially. Results are un-permuted before returning, so this is
+        # exact w.r.t. the unsorted path.
+        order = torch.argsort(lengths.long(), descending=True)
+        order_list = order.tolist()
+        ids_s, mask_s, len_s = ids[order], mask[order], lengths[order]
+        k_s = [predictor_k[i] for i in order_list] if per_row_k else predictor_k
+
+        def _k(start, end):
+            return list(k_s[start:end]) if per_row_k else k_s
+
         chunks = []
         for start in range(0, N, micro_bs):
             end = min(start + micro_bs, N)
             emb, _ = self._extract_embeddings(
-                ids[start:end], mask[start:end], lengths[start:end], use_ema=use_ema, requires_grad=False,
+                ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=use_ema, requires_grad=False,
                 predictor_k=_k(start, end), predictor_token_id=predictor_token_id,
             )
             chunks.append(emb)
-        return torch.cat(chunks, dim=0)
+        out_sorted = torch.cat(chunks, dim=0)
+        inv = torch.empty(N, dtype=torch.long, device=out_sorted.device)
+        inv[order.to(out_sorted.device)] = torch.arange(N, device=out_sorted.device)
+        return out_sorted[inv]
 
     # ------------------------------------------------ TCR reward scoring ---
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -459,8 +473,28 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 predictor_k=[cfg.predictor_k] * N,
                 predictor_token_id=cfg.predictor_token_id,
             )
-        aggressive_empty_cache(force_sync=True)
+        # No empty_cache here: embed_targets() always follows in the same shaping
+        # pass and does the (expensive, force-synced) flush once for both RPCs.
         return TensorDict({"cot_emb": emb.float().cpu()}, batch_size=[])
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def embed_targets(self, data: TensorDict) -> TensorDict:
+        """Forward-only LAST-REAL-TOKEN embeddings of verified-correct target views.
+
+        Encodes [x, y^+] with the CURRENT policy (predictor_k=0, no EMA, no backward),
+        L2-normalized — the online z^+ used by jepa-tcr-dual reward shaping, replacing
+        the old cached frozen-reference latents. Matches the predictor_k=0 read the
+        alignment loss uses for its targets.
+        """
+        assert self.jepa_cfg is not None, "Call jepa_init() before embed_targets()"
+        micro_bs = max(1, self.jepa_cfg.embed_micro_batch_size)
+        with self.actor.engine.eval_mode():
+            emb = self._embed_chunked_no_grad(
+                data["target_input_ids"], data["target_attn_mask"], data["target_lengths"],
+                use_ema=False, micro_bs=micro_bs, predictor_k=0,
+            )
+        aggressive_empty_cache(force_sync=True)
+        return TensorDict({"target_emb": emb.float().cpu()}, batch_size=[])
 
     def _embed_chunked_with_backward(
         self,
@@ -488,10 +522,8 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         computed independently per chunk — but the loss's gradient w.r.t. each
         row's embedding CAN be computed cheaply once the full (N, d) embedding
         tensor is assembled (d is tiny vs. activation memory). Three passes:
-          1. Forward each chunk (grad enabled) to get its embeddings, then
-             immediately detach+clone into a fresh leaf tensor and let that
-             chunk's transformer activation graph be freed before processing
-             the next chunk.
+          1. Forward each chunk (no_grad — only the values are needed) to get
+             its embeddings, cloned into a fresh leaf tensor per chunk.
           2. Concatenate the detached per-chunk leaves into the full (N, d)
              tensor, run the actual loss function on it (cheap — no transformer
              involved), and call .backward(). This populates `.grad` on each
@@ -544,41 +576,61 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             (alpha * loss + logits_anchor).backward()
             return metrics
 
+        # Sort rows by length so each chunk is padded to its own max length,
+        # not (in expectation) the global max — same exact-result trick as
+        # `_embed_chunked_no_grad`. The loss in pass 2 is computed on the pool
+        # RESTORED to the caller's row order (loss_fn's masks/group ids index
+        # the original layout); the un-permute is differentiable, so pass 2's
+        # backward still lands the right per-row gradient on each sorted leaf.
+        order = torch.argsort(lengths.long(), descending=True)
+        order_list = order.tolist()
+        ids_s, mask_s, len_s = ids[order], mask[order], lengths[order]
+        pk_s = [predictor_k[i] for i in order_list]
+
         bounds = [(s, min(s + micro_bs, N)) for s in range(0, N, micro_bs)]
 
-        # Pass 1: cache detached per-chunk embeddings (each chunk's forward
-        # graph is freed once its embedding is detached and we move on). The
-        # boundary read (also detached) is captured here too when requested.
+        # Pass 1: cache per-chunk embeddings under no_grad. Only the VALUES are
+        # needed here (pass 2 differentiates w.r.t. fresh leaf tensors; pass 3
+        # is the only pass that touches model parameters), so building a graph
+        # or storing activations in this pass is pure waste — no_grad halves
+        # pass-1 memory and lets larger micro-batches through unchanged.
+        # The boundary read (stop-grad by design) is captured here too.
         cached = []
         boundary_chunks = [] if also_boundary else None
-        for start, end in bounds:
-            if also_boundary:
-                chunk_emb, chunk_bnd, _ = self._extract_embeddings(
-                    ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
-                    predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
-                    also_boundary=True,
-                )
-                boundary_chunks.append(chunk_bnd.detach())
-            else:
-                chunk_emb, _ = self._extract_embeddings(
-                    ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
-                    predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
-                )
-            cached.append(chunk_emb.detach().clone().requires_grad_(True))
+        with torch.no_grad():
+            for start, end in bounds:
+                if also_boundary:
+                    chunk_emb, chunk_bnd, _ = self._extract_embeddings(
+                        ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=False,
+                        predictor_k=pk_s[start:end], predictor_token_id=cfg.predictor_token_id,
+                        also_boundary=True,
+                    )
+                    boundary_chunks.append(chunk_bnd)
+                else:
+                    chunk_emb, _ = self._extract_embeddings(
+                        ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=False,
+                        predictor_k=pk_s[start:end], predictor_token_id=cfg.predictor_token_id,
+                    )
+                cached.append(chunk_emb.clone().requires_grad_(True))
 
-        # Pass 2: compute the real loss on the full assembled pool, backward
-        # into the cached per-chunk leaves only (cheap — no transformer graph).
-        joint_emb_cached = torch.cat(cached, dim=0)
-        boundary_all = torch.cat(boundary_chunks, dim=0) if also_boundary else None
+        # Pass 2: compute the real loss on the full assembled pool (restored to
+        # original row order), backward into the cached per-chunk leaves only
+        # (cheap — no transformer graph).
+        dev = cached[0].device
+        inv = torch.empty(N, dtype=torch.long, device=dev)
+        inv[order.to(dev)] = torch.arange(N, device=dev)
+        joint_emb_cached = torch.cat(cached, dim=0)[inv]
+        boundary_all = torch.cat(boundary_chunks, dim=0)[inv] if also_boundary else None
         loss, metrics = _run_loss(joint_emb_cached, boundary_all)
         (alpha * loss).backward()
 
-        # Pass 3: re-forward each chunk live and backprop the cached gradient
-        # through it into the model parameters, one chunk's activations at a time.
+        # Pass 3: re-forward each (sorted) chunk live and backprop the cached
+        # gradient through it into the model parameters, one chunk's
+        # activations at a time.
         for (start, end), cached_chunk in zip(bounds, cached):
             chunk_emb_live, chunk_logits_anchor = self._extract_embeddings(
-                ids[start:end], mask[start:end], lengths[start:end], use_ema=False, requires_grad=True,
-                predictor_k=predictor_k[start:end], predictor_token_id=cfg.predictor_token_id,
+                ids_s[start:end], mask_s[start:end], len_s[start:end], use_ema=False, requires_grad=True,
+                predictor_k=pk_s[start:end], predictor_token_id=cfg.predictor_token_id,
             )
             torch.autograd.backward(
                 [chunk_emb_live, chunk_logits_anchor],
@@ -667,16 +719,55 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             if cfg.loss_type == "jepa-tcr-dual":
                 # Dual-target self-consistent TCR. One combined anchor block (CoT rows
                 # first, then Code rows; `is_code` recovers the split), each row with
-                # [PRED]. Each view's pred is pulled toward its OWN cached teacher
-                # target; each CoT pred is additionally pulled toward the stop-grad
-                # Code_S BOUNDARY read of its paired code rollout (self-consistency).
-                # SIGReg over both views' preds.
+                # [PRED]. Each view's pred is pulled toward its OWN verified-correct
+                # target z^+, recomputed ONLINE by the current policy from the stored
+                # y^+ text (stop-grad, no EMA); each CoT pred is additionally pulled
+                # toward the stop-grad Code_S BOUNDARY read of its paired code rollout
+                # (self-consistency). SIGReg over both views' preds.
                 anchor_ids = data["anchor_input_ids"]
                 anchor_mask = data["anchor_attn_mask"]
                 anchor_lengths = data["anchor_lengths"]
                 is_code = data["is_code"].bool()
                 cot_sel = ~is_code
                 N = anchor_ids.shape[0]
+
+                # Corrected TCR-JEPA: recompute the verified-correct targets z^+ ONLINE
+                # with the CURRENT policy (no EMA), under stop-gradient, instead of
+                # reading stale latents cached by a frozen reference encoder. The target
+                # block [x, y^+] is encoded last-real-token + L2-normalized (predictor_k=0,
+                # matching the prediction branch's pooling), so targets always live in the
+                # policy's present representation space. Rows are CoT-first then Code,
+                # aligned 1:1 with the anchor block (see ray_trainer target builder). The
+                # no-grad forward before the grad anchor forward mirrors the lejepa EMA
+                # path and keeps FSDP1 to one backward per step.
+                target_ids = data["target_input_ids"]
+                target_mask = data["target_attn_mask"]
+                target_lengths = data["target_lengths"]
+                with torch.no_grad():
+                    # Dedup identical target rows before encoding: the batch builder
+                    # emits one target row PER ANCHOR, and anchors of the same prompt
+                    # frequently map to the same y^+ text (k % n_u matching), so the
+                    # unique row count is often a small fraction of the block. Encode
+                    # each unique row once and scatter back — exact, order-preserving.
+                    tgt_lens = target_lengths.long().tolist()
+                    keys = [
+                        target_ids[b, : tgt_lens[b]].cpu().numpy().tobytes()
+                        for b in range(target_ids.shape[0])
+                    ]
+                    first_row: dict[bytes, int] = {}
+                    uniq_rows: list[int] = []
+                    inverse: list[int] = []
+                    for b, k in enumerate(keys):
+                        if k not in first_row:
+                            first_row[k] = len(uniq_rows)
+                            uniq_rows.append(b)
+                        inverse.append(first_row[k])
+                    uniq_idx = torch.tensor(uniq_rows, dtype=torch.long)
+                    uniq_emb = self._embed_chunked_no_grad(
+                        target_ids[uniq_idx], target_mask[uniq_idx], target_lengths[uniq_idx],
+                        use_ema=False, micro_bs=micro_bs, predictor_k=0,
+                    )
+                    teacher_target = uniq_emb[torch.tensor(inverse, dtype=torch.long, device=uniq_emb.device)]
 
                 # z_self (the Code_S boundary read, stop-grad) rides on the SAME forward
                 # that produces the [PRED] reads: `_embed_chunked_with_backward(..,
@@ -685,7 +776,6 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 # loss_fn gathers each CoT row's partner (self_partner indexes the code
                 # sub-block) from the boundary of the corresponding ABSOLUTE code row.
                 joint_predictor_k = [cfg.predictor_k] * N
-                teacher_target = data["teacher_target"]
                 group_id = data.get("anchor_group_id", None)
                 is_correct = data.get("anchor_is_correct", None)
                 self_partner = data.get("self_partner", None)

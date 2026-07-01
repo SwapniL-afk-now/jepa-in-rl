@@ -65,15 +65,14 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         self.jepa_cfg = JEPARayConfig.from_config(self.config.get("jepa", {}))
         self.jepa_cfg.validate(self.config.actor_rollout_ref.rollout.n)
 
-        # jepa-tcr-dual: load the offline CoT-view teacher-target cache once. Keyed by the
-        # dataset row index (extra_info["index"]); each value is a (n_i, d) tensor
-        # of L2-normalized teacher-correct target embeddings in student space.
-        self.teacher_targets: dict[int, torch.Tensor] | None = None
+        # Corrected TCR-JEPA: the CoT cache stores verified-correct SOLUTION TEXTS
+        # {dataset_index (int): [y^+ str, ...]}, NOT latent vectors. The target
+        # representation z^+ is recomputed ONLINE by the current policy at train time
+        # (worker.jepa_update), so there are no stale frozen-reference latents.
+        self.teacher_targets: dict[int, list[str]] | None = None
         if self.jepa_cfg.enable:
             raw = torch.load(self.jepa_cfg.teacher_cache_path, map_location="cpu")
-            self.teacher_targets = {
-                int(k): v.float() for k, v in raw.items() if v is not None and v.numel() > 0
-            }
+            self.teacher_targets = {int(k): list(v) for k, v in raw.items() if v}
 
         # Plateau-latch state for jepa.auto_off_enable (see _maybe_disable_jepa_signal).
         # Per-arm plateau latches: cot/code/self each plateau and latch INDEPENDENTLY,
@@ -85,15 +84,18 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         self._align_best: dict[str, float] = {k: float("-inf") for k in self._off_arm}
         self._align_stall: dict[str, int] = {k: 0 for k in self._off_arm}
 
-        # jepa-tcr-dual: a SECOND cache of Code-view teacher targets (coder-model
-        # solutions encoded by the same frozen reference), same {index: (n_i, d)}
-        # format and shared 1536-d student space.
-        self.code_teacher_targets: dict[int, torch.Tensor] | None = None
+        # A SECOND cache of Code-view verified-correct texts (coder-model solutions),
+        # same {index: [y^+ str, ...]} format. Encoded online at train time too.
+        self.code_teacher_targets: dict[int, list[str]] | None = None
         if self.jepa_cfg.enable:
             raw_code = torch.load(self.jepa_cfg.code_teacher_cache_path, map_location="cpu")
-            self.code_teacher_targets = {
-                int(k): v.float() for k, v in raw_code.items() if v is not None and v.numel() > 0
-            }
+            self.code_teacher_targets = {int(k): list(v) for k, v in raw_code.items() if v}
+
+        # Target-view tokenization cache. _tokenize_target is deterministic in
+        # (problem, y^+, view) but was re-applying the chat template + tokenizing
+        # the same targets twice per step (shaping + jepa batch build), every
+        # step. Unbounded growth is fine: bounded by the teacher caches' size.
+        self._tok_target_cache: dict[tuple[str, str, str], torch.Tensor] = {}
 
     # ------------------------------------------------------ worker setup ----
     def init_workers(self):
@@ -217,6 +219,34 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 valid_uids.append(u)
         return cot_by_uid, code_by_uid, valid_uids
 
+    def _tokenize_target(self, problem_text: str, resp_text: str, view: str) -> torch.Tensor:
+        """Tokenize the verified-correct target VIEW [x, y^+] for online z^+ recompute.
+
+        The policy encodes these ids (last-real-token, normalized) at train time — there
+        are no cached latents. Mirrors precompute's _row_messages framing: the code view
+        prepends the code system prompt so the target lives in the same representation
+        space the code-view rollouts are encoded in.
+        """
+        cache_key = (problem_text, resp_text, view)
+        hit = self._tok_target_cache.get(cache_key)
+        if hit is not None:
+            return hit
+        msgs = []
+        if view == "code" and self.jepa_cfg.code_system_prompt:
+            msgs.append({"role": "system", "content": self.jepa_cfg.code_system_prompt})
+        msgs.append({"role": "user", "content": problem_text})
+        ptext = self.tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
+        # Cap to the model's prompt+response budget so a long y^+ can't push the target
+        # view past the context window (the online encoder builds position ids up to the
+        # sequence length). Matches the rollouts' own MAX_PROMPT+MAX_RESPONSE bound.
+        max_len = int(self.config.data.max_prompt_length + self.config.data.max_response_length)
+        ids = self.tokenizer(ptext + resp_text, return_tensors="pt",
+                             truncation=True, max_length=max_len)["input_ids"][0]
+        self._tok_target_cache[cache_key] = ids
+        return ids
+
     def _build_jepa_batch_tcr_dual(
         self,
         batch: DataProto,
@@ -228,11 +258,11 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         per-CoT-row self-consistency partner pointing at the paired Code row.
 
         Layout:
-          - cot block (A_c rows): correct CoT rollouts of prompts with a cached CoT
-            target; `teacher_target` (A_c, d) from `self.teacher_targets`.
-          - code block (A_k rows): correct Code rollouts of prompts with a cached
-            Code target; `code_teacher_target` (A_k, d) from
-            `self.code_teacher_targets`.
+          - cot block (A_c rows): correct CoT rollouts of prompts with a stored CoT
+            verified-correct text; a parallel `target_input_ids` row holds the
+            tokenized [x, y^+] view, encoded online by the policy in the worker.
+          - code block (A_k rows): correct Code rollouts of prompts with a stored
+            Code verified-correct text; same parallel target row.
           - `self_partner` (A_c,) long: for each CoT row, the row index INTO THE CODE
             BLOCK of its paired (same-prompt, same-slot) code rollout, or -1. The
             worker reads that code row's BOUNDARY embedding as the stop-grad
@@ -277,12 +307,16 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         def _match_row(k, n_u):
             return int(torch.randint(n_u, (1,)).item()) if self.jepa_cfg.tcr_match == "random" else k % n_u
 
+        def _problem(i):
+            info = extra_infos[i]
+            return info["problem"] if isinstance(info, dict) else str(info)
+
         # Single combined anchor block (CoT rows FIRST, then Code rows) so the
         # DataProto keeps one uniform batch dim even when the two views have
         # different anchor counts. `is_code` recovers the split; `self_partner`
         # (only set on CoT rows) indexes into the CODE sub-block (0..A_k-1).
-        cot_ids_list, cot_lengths, cot_target_list, cot_gid, cot_ic = [], [], [], [], []
-        code_ids_list, code_lengths, code_target_list, code_gid, code_ic = [], [], [], [], []
+        cot_ids_list, cot_lengths, cot_tgt_ids, cot_gid, cot_ic = [], [], [], [], []
+        code_ids_list, code_lengths, code_tgt_ids, code_gid, code_ic = [], [], [], [], []
         self_pairs: list = []   # (cot_row_pos, code_row_pos) — positions within each sub-block
         n_correct_list = []
         group_counter = 0
@@ -290,8 +324,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             ds_idx = idx_by_uid.get(u)
             Z_cot = self.teacher_targets.get(ds_idx) if ds_idx is not None else None
             Z_code = self.code_teacher_targets.get(ds_idx) if ds_idx is not None else None
-            cot_sel = _select(rows_by_uid[u]["cot"]) if (Z_cot is not None and Z_cot.numel() > 0) else []
-            code_sel = _select(rows_by_uid[u]["code"]) if (Z_code is not None and Z_code.numel() > 0) else []
+            cot_sel = _select(rows_by_uid[u]["cot"]) if Z_cot else []
+            code_sel = _select(rows_by_uid[u]["code"]) if Z_code else []
             if not cot_sel and not code_sel:
                 continue
             gid = group_counter
@@ -305,7 +339,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     cot_pos = len(cot_ids_list)
                     cot_ids_list.append(all_input_ids[idx][all_attn_mask[idx].bool()])
                     cot_lengths.append(int(all_attn_mask[idx].sum()))
-                    cot_target_list.append(Z_cot[_match_row(k, Z_cot.shape[0])])
+                    cot_tgt_ids.append(self._tokenize_target(_problem(idx), Z_cot[_match_row(k, len(Z_cot))], "cot"))
                     cot_gid.append(gid)
                     cot_ic.append(bool(rew[idx] > 0))
                 if k < len(code_sel):
@@ -313,7 +347,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     code_pos = len(code_ids_list)
                     code_ids_list.append(all_input_ids[idx][all_attn_mask[idx].bool()])
                     code_lengths.append(int(all_attn_mask[idx].sum()))
-                    code_target_list.append(Z_code[_match_row(k, Z_code.shape[0])])
+                    code_tgt_ids.append(self._tokenize_target(_problem(idx), Z_code[_match_row(k, len(Z_code))], "code"))
                     code_gid.append(gid)
                     code_ic.append(bool(rew[idx] > 0))
                 if cot_pos is not None and code_pos is not None:
@@ -335,9 +369,19 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, max_len - length))
             for length in all_lengths
         ])
-        target = torch.nn.functional.normalize(
-            torch.stack(cot_target_list + code_target_list, dim=0).float(), dim=-1
-        )
+        # Parallel verified-correct TARGET block [x, y^+], CoT-first then Code, aligned
+        # 1:1 with the anchor block. Encoded online by the policy (worker.jepa_update)
+        # into z^+ — no cached latents.
+        tgt_ids_all = cot_tgt_ids + code_tgt_ids
+        tgt_lengths = [int(t.shape[0]) for t in tgt_ids_all]
+        tgt_max = max(tgt_lengths)
+        target_input_ids = torch.stack([
+            torch.nn.functional.pad(t, (0, tgt_max - t.shape[0]), value=pad_id) for t in tgt_ids_all
+        ])
+        target_attn_mask = torch.stack([
+            torch.nn.functional.pad(torch.ones(length, dtype=torch.long), (0, tgt_max - length))
+            for length in tgt_lengths
+        ])
         is_code = torch.tensor([False] * A_c + [True] * A_k, dtype=torch.bool)
         group_id = torch.tensor(cot_gid + code_gid, dtype=torch.long)
         is_correct = torch.tensor(cot_ic + code_ic, dtype=torch.bool)
@@ -350,7 +394,9 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             "anchor_input_ids": anchor_ids,
             "anchor_attn_mask": anchor_mask,
             "anchor_lengths": torch.tensor(all_lengths, dtype=torch.long),
-            "teacher_target": target,
+            "target_input_ids": target_input_ids,
+            "target_attn_mask": target_attn_mask,
+            "target_lengths": torch.tensor(tgt_lengths, dtype=torch.long),
             "is_code": is_code,
             "anchor_group_id": group_id,
             "anchor_is_correct": is_correct,
@@ -409,7 +455,8 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         """jepa-tcr-dual teacher-alignment reward shaping (folded into token_level_rewards).
 
         Scores every CoT *and* Code rollout's [PRED] latent against its question's
-        cached teacher-correct targets, standardizes the score WITHIN its
+        verified-correct targets (recomputed online by the current policy from the
+        stored y^+ text, predictor_k=0), standardizes the score WITHIN its
         (uid, view, is_correct) reward stratum, and returns a per-row additive
         reward term β·ŝ_i. Both views are shaped symmetrically with the dual-view
         JEPA loss arm.
@@ -479,13 +526,49 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             out = out[0] if out else None
         emb = out["cot_emb"].float()  # (n_rows, d), L2-normalized
 
-        # s_i = max_k <p_i, z_k> over the question's cached targets.
+        # Recompute this batch's verified-correct target embeddings z^+ ONLINE (current
+        # policy, predictor_k=0), replacing the old cached frozen-ref latents. Each unique
+        # (ds_idx, view) target-text set is tokenized and embedded once via the worker.
+        def _pf(i):
+            info = extra_infos[i]
+            return info["problem"] if isinstance(info, dict) else str(info)
+
+        flat_target_ids: list = []
+        slots: dict = {}   # (ds_idx, view) -> (start, end) into flat_target_ids
+        for j, i in enumerate(scored_rows):
+            key = (int(extra_infos[i]["index"]), scored_views[j])
+            if key in slots:
+                continue
+            start = len(flat_target_ids)
+            for t in _cache_for(key[1])[key[0]]:
+                flat_target_ids.append(self._tokenize_target(_pf(i), t, key[1]))
+            slots[key] = (start, len(flat_target_ids))
+
+        t_lengths = [int(t.shape[0]) for t in flat_target_ids]
+        t_max = max(t_lengths)
+        t_ids = torch.stack([
+            torch.nn.functional.pad(t, (0, t_max - t.shape[0]), value=pad_id) for t in flat_target_ids
+        ])
+        t_mask = torch.stack([
+            torch.nn.functional.pad(torch.ones(L, dtype=torch.long), (0, t_max - L)) for L in t_lengths
+        ])
+        tgt_td = DataProto.from_single_dict({
+            "target_input_ids": t_ids,
+            "target_attn_mask": t_mask,
+            "target_lengths": torch.tensor(t_lengths, dtype=torch.long),
+        }).to_tensordict()
+        tout = self.actor_rollout_wg.embed_targets(tgt_td)
+        if isinstance(tout, list):
+            tout = tout[0] if tout else None
+        Z_all = tout["target_emb"].float()  # (M, d), L2-normalized
+
+        # s_i = max_k <p_i, z^+_k> over the question's online targets.
         s = torch.empty(len(scored_rows), dtype=torch.float32)
         is_correct = torch.empty(len(scored_rows), dtype=torch.bool)
         gids = []
         for j, i in enumerate(scored_rows):
-            ds_idx = int(extra_infos[i]["index"])
-            Z = _cache_for(scored_views[j])[ds_idx].to(emb.dtype)  # (n_i, d), per-view cache
+            a, b = slots[(int(extra_infos[i]["index"]), scored_views[j])]
+            Z = Z_all[a:b].to(emb.dtype)
             s[j] = (emb[j].unsqueeze(0) * Z).sum(dim=-1).max()
             is_correct[j] = bool(rew[i] > 0)
             # Stratum key includes the view so CoT and Code are standardized against
@@ -597,7 +680,12 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         a CUDA context (which would itself consume GPU memory on this memory-tight
         colocated setup). Device-level used memory captures BOTH the vLLM EngineCore
         and the FSDP-actor worker processes. Best-effort: never raises into the loop.
+
+        Opt-in via JEPA_LOG_GPU_MEM=1: five nvidia-smi subprocesses per step cost
+        ~0.5-1 s of wall clock, only worth paying when debugging memory.
         """
+        if os.environ.get("JEPA_LOG_GPU_MEM", "0") != "1":
+            return
         try:
             import subprocess
 
