@@ -527,6 +527,8 @@ class AgentLoopWorker:
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
             sample_sampling_params = dict(sampling_params)
+            if "seed" in batch.meta_info:
+                sample_sampling_params["seed"] = int(batch.meta_info["seed"]) + int(i)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
             tasks.append(

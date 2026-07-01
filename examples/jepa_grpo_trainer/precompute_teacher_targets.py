@@ -29,14 +29,14 @@ both caches live in one shared 1536-d student space.
   2. Each is VERIFIED with the same checker used in training
      (verl.experimental.fepo.math_parser.compute_math_reward); only correct ones
      are kept (up to --n-targets per question).
-  3. Each kept teacher-correct *text* [x, y_T+] is ENCODED by a frozen
-     STUDENT-SIZE reference model (e.g. Qwen2.5-Math-1.5B): final-layer hidden
-     state at the last real token, L2-normalized -> a d-dim vector in the
-     student's own representation space (so training needs NO projector and no
-     cross-dimension cosine).
-  4. The per-question targets are SAVED as a torch dict
-     {dataset_index (int): float16 tensor (n_i, d)} consumed at training time by
-     ray_trainer._build_jepa_batch_tcr via jepa.teacher_cache_path.
+  3. The per-question verified-correct *texts* are SAVED as a torch dict
+     {dataset_index (int): [y^+ str, ...]} consumed at training time via
+     jepa.teacher_cache_path.
+
+CORRECTED TCR-JEPA: we store ONLY the verified-correct solution text y^+ — NO hidden
+states, NO latent vectors, NO frozen reference encoder. The target representation
+z^+ = normalize(f_theta([x, y^+])) is recomputed ONLINE by the CURRENT policy (with
+stop-gradient) inside ray_trainer/worker at training time, so targets never go stale.
 
 The teacher model is only loaded here; it is NOT loaded during training.
 """
@@ -80,8 +80,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher-model", "--gen-model", dest="teacher_model", required=True,
                    help="HF path of the generator: stronger math teacher for --view cot, "
                         "or a coder model (e.g. Qwen2.5-Coder-*) for --view code")
-    p.add_argument("--ref-model", required=True, help="HF path of the frozen student-size reference encoder")
-    p.add_argument("--out", required=True, help="Output .pt path for the {index: (n_i,d)} target cache")
+    p.add_argument("--ref-model", default="", help="DEPRECATED/unused: targets are recomputed online by the policy, not encoded offline")
+    p.add_argument("--out", required=True, help="Output .pt path for the {index: [y^+ texts]} verified-correct text cache")
     p.add_argument("--n-samples", type=int, default=8, help="Teacher samples generated per question")
     p.add_argument("--n-targets", type=int, default=4, help="Max correct targets kept per question")
     p.add_argument("--max-rows", type=int, default=-1, help="Cap on questions processed (-1 = all)")
@@ -206,39 +206,19 @@ def main() -> None:
     print(f"[precompute] {len(kept)}/{len(rows)} questions have >=1 correct teacher response "
           f"({n_correct_total} target texts total)")
 
-    # Free the teacher before loading the reference encoder.
     del teacher
     torch.cuda.empty_cache()
 
-    # ---- Phase 1c: encode with the frozen student-size reference model ----
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    ref_tok = AutoTokenizer.from_pretrained(args.ref_model, trust_remote_code=True)
-    if ref_tok.pad_token_id is None:
-        ref_tok.pad_token = ref_tok.eos_token
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        args.ref_model, torch_dtype=torch.bfloat16, trust_remote_code=True
-    ).to(device).eval()
+    # ---- Phase 1c: save the verified-correct TEXT cache (no encoding) ----
+    # Corrected TCR-JEPA stores only y^+ text; z^+ is recomputed online by the policy.
+    cache_text: dict[int, list[str]] = {idx: responses for idx, _prompt, responses in kept}
+    torch.save(cache_text, args.out)
+    print(f"[precompute] wrote verified-correct text targets for {len(cache_text)} questions -> {args.out}")
 
-    cache: dict[int, torch.Tensor] = {}
-    responses_by_idx: dict[int, list[str]] = {}
-    for idx, prompt, responses in kept:
-        prompt_text = ref_tok.apply_chat_template(
-            _row_messages(prompt, system_prompt), tokenize=False, add_generation_prompt=True
-        )
-        targets = encode_targets(
-            ref_model, ref_tok, prompt_text, responses, device, args.encode_batch_size
-        )
-        cache[idx] = targets.half()
-        responses_by_idx[idx] = responses
-
-    torch.save(cache, args.out)
-    print(f"[precompute] wrote {len(cache)} questions -> {args.out} "
-          f"(d={next(iter(cache.values())).shape[-1] if cache else 'n/a'})")
-
-    # Persist the raw teacher-correct response texts (default: alongside the target cache).
-    resp_path = args.save_responses or (args.out + ".responses.pt")
-    torch.save(responses_by_idx, resp_path)
-    print(f"[precompute] wrote correct response texts for {len(responses_by_idx)} questions -> {resp_path}")
+    # Optional duplicate copy under the legacy .responses.pt name, if requested.
+    if args.save_responses:
+        torch.save(cache_text, args.save_responses)
+        print(f"[precompute] also wrote text targets -> {args.save_responses}")
 
 
 if __name__ == "__main__":

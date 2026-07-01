@@ -8,11 +8,8 @@
 #   - KL divergence dropped entirely (no KL loss, no entropy bonus)
 # Trained on agentica-org/DeepScaleR-Preview-Dataset (~40k AIME/AMC/Omni-MATH/Still problems).
 #
-# NOTE on Dynamic Sampling: DAPO's full dynamic sampling (resample gen batches until enough
-# non-degenerate groups remain) lives in the dedicated dapo recipe trainer. The standard
-# `verl.trainer.main_ppo` entry used here honours data.gen_batch_size but does NOT run the
-# resampling loop, so algorithm.filter_groups is left disabled by default below. Enable it only
-# when launching through the dapo recipe trainer.
+# Dynamic Sampling: this tree's PPO trainer filters oversampled DAPO groups when
+# algorithm.filter_groups.enable=True, keeping only non-degenerate groups for actor updates.
 #
 # Before first run:
 #   hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --local-dir /workspace/models/DeepSeek-R1-Distill-Qwen-1.5B
@@ -64,7 +61,7 @@ export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_SILENT=${WANDB_SILENT:-true}
 
 ########################### user-adjustable ###########################
-MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
+MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
 TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
@@ -96,7 +93,7 @@ BEST_CKPT_SOURCES=${BEST_CKPT_SOURCES:-'["aime24","aime25","aime26","amc23"]'}
 #   combined (default) = 0.5*(avg@k + pass@k) | avg | pass | avg@N | pass@N
 # "pass@8" selects on the per-source val pass_at_8 averaged across BEST_CKPT_SOURCES,
 # i.e. maximize MEAN pass@8 (best-of-8 success rate). VAL_ROLLOUT_N must be >= 8.
-BEST_CKPT_METRIC=${BEST_CKPT_METRIC:-pass@8}
+BEST_CKPT_METRICS=${BEST_CKPT_METRICS:-'["avg@8","pass@8"]'}
 # Held-out benchmarks for the one-off final evaluation after training, using the
 # best checkpoint (not seen during training validation).
 FINAL_VAL_FILES="[${EVAL_DATA_DIR}/math500.parquet,${EVAL_DATA_DIR}/minervamath.parquet,${EVAL_DATA_DIR}/olympiadbench.parquet,${EVAL_DATA_DIR}/humanevalplus.parquet,${EVAL_DATA_DIR}/mbppplus.parquet,${EVAL_DATA_DIR}/livecodebench.parquet]"
@@ -158,13 +155,9 @@ OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-614}           # ~20% of MAX_RESPONSE
 OVERLONG_PENALTY_FACTOR=${OVERLONG_PENALTY_FACTOR:-1.0}
 
 # DAPO dynamic sampling (group filtering). Canonical DAPO oversamples the generation
-# batch (official recipe: gen 1536 / train 512 = 3x) and resamples groups whose rollouts
-# all share the same metric (acc all-0 or all-1) until train_batch_size qualified groups
-# remain. IMPORTANT: the resample loop is NOT implemented in this tree's
-# `verl.trainer.main_ppo` (no Python reads algorithm.filter_groups here) — it lives only in
-# the dedicated dapo recipe trainer. So this stays OFF for main_ppo; the canonical values
-# below are pre-set so the run is correct the moment it's launched under a dapo trainer.
-FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE:-false}
+# batch (official recipe: gen 1536 / train 512 = 3x) and keeps groups whose rollouts
+# are non-degenerate under the configured metric (acc mixed rather than all-0/all-1).
+FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE:-true}
 FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC:-acc}
 MAX_NUM_GEN_BATCHES=${MAX_NUM_GEN_BATCHES:-10}
 # Under main_ppo (no resample loop) gen must equal train, else extra prompts are generated
@@ -188,10 +181,11 @@ ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.75}   # 0.75 left vLLM holding to
 ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}   # more parallel sequences during vLLM rollout
-VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}    # halved vs. 1.5B to bound val-time rollout memory
+VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-8}    # halved vs. 1.5B to bound val-time rollout memory
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
+VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[31415,27182,16180]'}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}   # fixed-length run on dapo-math-17k
@@ -227,7 +221,7 @@ DATA=(
     data.truncation='error'
 )
 
-# DAPO dynamic sampling (group filtering). Only effective under the dapo recipe trainer.
+# DAPO dynamic sampling (group filtering).
 if [[ "${FILTER_GROUPS_ENABLE}" == "true" ]]; then
     DATA+=(
         +algorithm.filter_groups.enable=True
@@ -321,7 +315,8 @@ TRAINER=(
     trainer.validation_data_dir=${VALIDATION_DATA_DIR}
     trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP}
     +trainer.best_ckpt_sources=${BEST_CKPT_SOURCES}
-    +trainer.best_ckpt_metric=${BEST_CKPT_METRIC}
+    +trainer.best_ckpt_metrics=${BEST_CKPT_METRICS}
+    +trainer.validation_seeds=${VALIDATION_SEEDS}
 )
 
 EXTRA=(

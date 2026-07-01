@@ -180,12 +180,14 @@ class JEPARayConfig:
         if not self.teacher_cache_path:
             raise ValueError(
                 "jepa.loss_type='jepa-tcr-dual' requires jepa.teacher_cache_path "
-                "(the CoT-view teacher cache from precompute_teacher_targets.py --view cot)"
+                "(the CoT-view verified-correct TEXT cache {idx: [y^+,...]} from "
+                "precompute_teacher_targets.py --view cot; z^+ is recomputed online)"
             )
         if not self.code_teacher_cache_path:
             raise ValueError(
                 "jepa.loss_type='jepa-tcr-dual' requires jepa.code_teacher_cache_path "
-                "(the Code-view cache from precompute_teacher_targets.py --view code)"
+                "(the Code-view verified-correct TEXT cache from "
+                "precompute_teacher_targets.py --view code; z^+ is recomputed online)"
             )
         if self.tcr_match not in ("cycle", "random"):
             raise ValueError(f"jepa.tcr_match must be 'cycle' or 'random'; got {self.tcr_match!r}")

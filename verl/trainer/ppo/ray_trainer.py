@@ -613,7 +613,7 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
-    def _validate(self, merged: bool = False):
+    def _validate_once(self, merged: bool = False, seed: int | None = None):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -652,6 +652,8 @@ class RayPPOTrainer:
                 "validate": True,
                 "global_steps": self.global_steps,
             }
+            if seed is not None:
+                test_gen_batch.meta_info["seed"] = int(seed)
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -745,6 +747,50 @@ class RayPPOTrainer:
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_outputs)
+
+
+    def _parse_validation_seeds(self) -> list[int]:
+        seeds = self.config.trainer.get("validation_seeds", None)
+        if not seeds:
+            return []
+        if isinstance(seeds, str):
+            try:
+                seeds = json.loads(seeds)
+            except json.JSONDecodeError:
+                seeds = [item.strip() for item in seeds.split(",") if item.strip()]
+        return [int(seed) for seed in seeds]
+
+    def _aggregate_seeded_validation_metrics(self, per_seed_metrics: dict[int, dict]) -> dict:
+        metrics: dict[str, Any] = {}
+        for seed, seed_metrics in per_seed_metrics.items():
+            for key, value in seed_metrics.items():
+                metrics[f"{key}/seed_{seed}"] = value
+        all_keys = sorted({key for seed_metrics in per_seed_metrics.values() for key in seed_metrics})
+        for key in all_keys:
+            values = [seed_metrics[key] for seed_metrics in per_seed_metrics.values() if key in seed_metrics]
+            if not values or not all(isinstance(v, (int, float, np.floating, np.integer)) for v in values):
+                continue
+            arr = np.asarray(values, dtype=float)
+            metrics[key] = float(arr.mean())
+            metrics[f"{key}/mean"] = float(arr.mean())
+            metrics[f"{key}/std"] = float(arr.std())
+        return metrics
+
+    def _validate(self, merged: bool = False):
+        if merged:
+            return self._validate_once(merged=True)
+        seeds = self._parse_validation_seeds()
+        if not seeds:
+            return self._validate_once()
+        per_seed_metrics = {}
+        for seed in seeds:
+            print(f"validation seed={seed} start", flush=True)
+            per_seed_metrics[seed] = self._validate_once(seed=seed)
+            print(f"validation seed={seed} end", flush=True)
+        metrics = self._aggregate_seeded_validation_metrics(per_seed_metrics)
+        metrics["validation/seed_count"] = len(seeds)
+        metrics["validation/seeds"] = ",".join(str(seed) for seed in seeds)
+        return metrics
 
 
     def _text_repetition_rate(self, text: str, ngram: int = 4) -> float:
@@ -867,6 +913,52 @@ class RayPPOTrainer:
             metrics[f"{base}/response_length_std"] = std(response_lengths)
             metrics[f"{base}/repetition_rate"] = mean(repetition_rates)
         return metrics
+
+    def _filter_dapo_groups(self, batch: DataProto, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict[str, list]):
+        filter_cfg = self.config.algorithm.get("filter_groups", None)
+        if not filter_cfg or not filter_cfg.get("enable", False):
+            return batch, reward_tensor, reward_extra_infos_dict, {}
+
+        metric_name = filter_cfg.get("metric", "acc")
+        if metric_name in reward_extra_infos_dict and len(reward_extra_infos_dict[metric_name]) == len(batch):
+            metric_values = [float(v) for v in reward_extra_infos_dict[metric_name]]
+        else:
+            metric_values = reward_tensor.sum(-1).detach().cpu().float().tolist()
+
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(batch.non_tensor_batch.get("uid", [])):
+            uid_to_indices[str(uid)].append(idx)
+
+        selected_group_indices: list[list[int]] = []
+        for indices in uid_to_indices.values():
+            values = [metric_values[i] for i in indices if i < len(metric_values)]
+            if not values:
+                continue
+            positives = [value > 0.0 for value in values]
+            if any(positives) and not all(positives):
+                selected_group_indices.append(indices)
+
+        target_groups = int(self.config.data.train_batch_size)
+        selected_indices = [idx for group in selected_group_indices[:target_groups] for idx in group]
+        metrics = {
+            "dapo_filter/input_groups": float(len(uid_to_indices)),
+            "dapo_filter/kept_groups": float(min(len(selected_group_indices), target_groups)),
+            "dapo_filter/qualified_groups": float(len(selected_group_indices)),
+        }
+        if not selected_indices:
+            print("DAPO filter_groups found no mixed groups; using unfiltered batch", flush=True)
+            metrics["dapo_filter/fallback_unfiltered"] = 1.0
+            return batch, reward_tensor, reward_extra_infos_dict, metrics
+
+        batch = batch[selected_indices]
+        reward_tensor = reward_tensor[selected_indices]
+        filtered_extra = {}
+        for key, values in reward_extra_infos_dict.items():
+            if len(values) == len(metric_values):
+                filtered_extra[key] = [values[i] for i in selected_indices]
+            else:
+                filtered_extra[key] = values
+        return batch, reward_tensor, filtered_extra, metrics
 
     def _compute_train_comparison_metrics(self, batch: DataProto) -> dict[str, float | int]:
         scores = batch.batch["token_level_scores"].sum(-1).detach().cpu().float().tolist()
@@ -1240,11 +1332,41 @@ class RayPPOTrainer:
                 )
                 avg_w = f"{avg_at_k:.6f}" if avg_at_k is not None else "nan"
                 pass_w = f"{pass_at_k:.6f}" if pass_at_k is not None else "nan"
-                with open(os.path.join(self.config.trainer.default_local_dir, dir_name, "best_val_acc.txt"), "w") as f:
+                best_dir = os.path.join(self.config.trainer.default_local_dir, dir_name)
+                with open(os.path.join(best_dir, "best_val_acc.txt"), "w") as f:
                     f.write(
                         f"step={self.global_steps} metric={metric} score={combined:.6f} "
                         f"avg_at_k={avg_w} pass_at_k={pass_w} sources={best_ckpt_sources}\n"
                     )
+
+                seeds = self._parse_validation_seeds()
+                field = None
+                if "@" in metric and metric.split("@", 1)[0] in ("avg", "pass"):
+                    kind, _, budget = metric.partition("@")
+                    field = f"{kind}_at_{budget}"
+                seed_values = {}
+                if field and seeds:
+                    for seed in seeds:
+                        values = [
+                            val_metrics[f"val/{source}/{field}/seed_{seed}"]
+                            for source in best_ckpt_sources
+                            if f"val/{source}/{field}/seed_{seed}" in val_metrics
+                        ]
+                        if values:
+                            seed_values[str(seed)] = float(sum(values) / len(values))
+                metadata = {
+                    "selected_metric": metric,
+                    "global_step": int(self.global_steps),
+                    "benchmark_sources": list(best_ckpt_sources),
+                    "seed_list": seeds,
+                    "per_seed_values": seed_values,
+                    "mean_score": float(combined),
+                    "std_score": float(np.asarray(list(seed_values.values()), dtype=float).std()) if seed_values else 0.0,
+                    "avg_at_k": None if avg_at_k is None else float(avg_at_k),
+                    "pass_at_k": None if pass_at_k is None else float(pass_at_k),
+                }
+                with open(os.path.join(best_dir, "best_metadata.json"), "w") as f:
+                    json.dump(metadata, f, indent=2, sort_keys=True)
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -2304,6 +2426,14 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        batch, reward_tensor, reward_extra_infos_dict, dapo_filter_metrics = self._filter_dapo_groups(
+                            batch, reward_tensor, reward_extra_infos_dict
+                        )
+                        metrics.update(dapo_filter_metrics)
+                        if dapo_filter_metrics.get("dapo_filter/kept_groups", 0.0) > 0.0:
+                            batch.meta_info["global_token_num"] = torch.sum(
+                                batch.batch["attention_mask"], dim=-1
+                            ).tolist()
                         tafr_wrong_collected = self._tafr_collect_failures(batch, reward_tensor)
 
                     # TAFR anchor/replay log-prob scoring, ordered around the vLLM sleep:

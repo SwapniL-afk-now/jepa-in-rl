@@ -273,9 +273,9 @@ def _prompt_stratified_align(
 
 def llm_jepa_tcr_dual_loss(
     pred_cot: torch.Tensor,             # (A_c, d) CoT student [PRED] reads, L2-normalized
-    teacher_target_cot: torch.Tensor,  # (A_c, d) cached CoT teacher targets (constant)
+    teacher_target_cot: torch.Tensor,  # (A_c, d) CoT z^+, recomputed online by current policy (sg)
     pred_code: torch.Tensor,           # (A_k, d) Code student [PRED] reads, L2-normalized
-    teacher_target_code: torch.Tensor, # (A_k, d) cached Code teacher targets (constant)
+    teacher_target_code: torch.Tensor, # (A_k, d) Code z^+, recomputed online by current policy (sg)
     self_target: torch.Tensor,         # (A_c, d) Code_S BOUNDARY reads paired to CoT rows (raw, will be detached)
     self_mask: torch.Tensor,           # (A_c,) bool: True where a CoT row has a Code partner
     cot_group_id: torch.Tensor | None = None,
@@ -308,7 +308,9 @@ def llm_jepa_tcr_dual_loss(
     crossview_partner term in llm_jepa_tcr_loss (which moves both [PRED] reads). L_self
     self-gates to 0 when no CoT row has a code partner (self_mask all-False).
 
-    Both teacher targets are stop-gradiented constants (cached). SIGReg over the student
+    Both teacher targets are z^+ = normalize(f_theta([x, y^+])) recomputed online by the
+    current policy (no EMA) and stop-gradiented here (sg), so they track the policy's
+    representation space instead of being stale cached frozen-ref latents. SIGReg over the student
     preds of BOTH views supplies anti-collapse, preserving the load-bearing global-radius
     rescale on unit-sphere inputs (see sigreg_loss / project_jepa_sigreg_collapse).
     """
