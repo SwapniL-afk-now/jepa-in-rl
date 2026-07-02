@@ -1175,6 +1175,7 @@ class FSDPEngine(BaseEngine):
         global_step: int = 0,
         max_ckpt_to_keep: Optional[int] = None,
         tag: str = "default",
+        save_contents: Optional[list[str]] = None,
         **kwargs,
     ) -> None:
         """
@@ -1190,6 +1191,7 @@ class FSDPEngine(BaseEngine):
             global_step=global_step,
             max_ckpt_to_keep=max_ckpt_to_keep,
             tag=tag,
+            save_contents=save_contents,
         )
 
         torch.distributed.barrier()

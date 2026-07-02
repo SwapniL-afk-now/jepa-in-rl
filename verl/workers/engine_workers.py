@@ -464,8 +464,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
         return final_output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, tag="default"):
-        return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, tag=tag)
+    def save_checkpoint(
+        self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, tag="default", save_contents=None
+    ):
+        return self.engine.save_checkpoint(
+            local_path, hdfs_path, global_step, max_ckpt_to_keep, tag=tag, save_contents=save_contents
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
@@ -697,9 +701,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, tag="default"):
+    def save_checkpoint(
+        self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, tag="default", save_contents=None
+    ):
         assert "actor" in self.role, "save_checkpoint only support actor role"
-        self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, tag=tag)
+        self.actor.save_checkpoint(
+            local_path, hdfs_path, global_step, max_ckpt_to_keep, tag=tag, save_contents=save_contents
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def tafr_init(self, tafr_config: dict):

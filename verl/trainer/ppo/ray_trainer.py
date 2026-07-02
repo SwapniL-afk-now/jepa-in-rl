@@ -1328,7 +1328,12 @@ class RayPPOTrainer:
                 )
                 best_local_path = os.path.join(self.config.trainer.default_local_dir, dir_name, "actor")
                 self.actor_rollout_wg.save_checkpoint(
-                    best_local_path, None, self.global_steps, max_ckpt_to_keep=1, tag=dir_name
+                    best_local_path,
+                    None,
+                    self.global_steps,
+                    max_ckpt_to_keep=1,
+                    tag=dir_name,
+                    save_contents=["peft_adapter", "extra"],
                 )
                 avg_w = f"{avg_at_k:.6f}" if avg_at_k is not None else "nan"
                 pass_w = f"{pass_at_k:.6f}" if pass_at_k is not None else "nan"
@@ -1741,6 +1746,27 @@ class RayPPOTrainer:
         )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        batch_size = batch_td.batch_size[0]
+        if batch_size % ppo_mini_batch_size != 0:
+            rollout_n = self.config.actor_rollout_ref.rollout.n
+            min_mini_batch_size = max(rollout_n, ppo_mini_batch_size // 2)
+            adjusted_mini_batch_size = next(
+                (
+                    size
+                    for size in range(ppo_mini_batch_size - rollout_n, min_mini_batch_size - 1, -rollout_n)
+                    if batch_size % size == 0
+                ),
+                None,
+            )
+            if adjusted_mini_batch_size is None:
+                adjusted_mini_batch_size = batch_size
+            print(
+                "Adjusted actor mini-batch size after filtering: "
+                f"{ppo_mini_batch_size} -> {adjusted_mini_batch_size} "
+                f"(batch_size={batch_size})",
+                flush=True,
+            )
+            ppo_mini_batch_size = adjusted_mini_batch_size
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle

@@ -182,7 +182,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         torch.distributed.barrier()
 
     def save_checkpoint(
-        self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None, tag: str = "default"
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        global_step: int = 0,
+        max_ckpt_to_keep=None,
+        tag: str = "default",
+        save_contents: list[str] | None = None,
     ):
         """
         Save an FSDP checkpoint for this rank.
@@ -217,10 +223,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         local_path = local_mkdir_safe(local_path)
         torch.distributed.barrier()
 
+        checkpoint_save_contents = save_contents if save_contents is not None else self.checkpoint_save_contents
+        should_save_model = "model" in checkpoint_save_contents
+        should_save_peft_adapter = "peft_adapter" in checkpoint_save_contents
+        should_save_optimizer = "optimizer" in checkpoint_save_contents
+        should_save_extra = "extra" in checkpoint_save_contents
+
         # check if the checkpoint_save_contents is valid
-        if self.should_save_model:
-            assert self.model is not None, "model must be provided when checkpoint_contents.save includes ['model']"
-        if self.should_save_optimizer:
+        if should_save_model or should_save_peft_adapter:
+            assert self.model is not None, "model must be provided when checkpoint_contents.save includes model weights"
+        if should_save_optimizer:
             assert self.optimizer is not None, (
                 "optimizer must be provided when checkpoint_contents.save includes ['optimizer']"
             )
@@ -235,17 +247,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
 
-                if self.should_save_model:
+                if should_save_model:
                     model_state_dict = self.model.state_dict()
                     torch.save(model_state_dict, model_path)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 
-                if self.should_save_optimizer:
+                if should_save_optimizer:
                     optimizer_state_dict = self.optimizer.state_dict()
                     torch.save(optimizer_state_dict, optim_path)
                     log_with_rank(f"Saved optim to {os.path.abspath(optim_path)}", rank=self.rank, logger=logger)
 
-                if self.should_save_extra:
+                if should_save_extra:
                     lr_scheduler_state_dict = self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None
                     extra_state_dict = {
                         "lr_scheduler": lr_scheduler_state_dict,
@@ -294,6 +306,19 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             # loaded from the Hub.
             if hasattr(model_config, "auto_map"):
                 custom_object_save(unwrap_model, hf_config_tokenizer_path, config=model_config)
+
+            if should_save_peft_adapter:
+                if not hasattr(unwrap_model, "save_pretrained") or not hasattr(unwrap_model, "peft_config"):
+                    raise RuntimeError("peft_adapter checkpoint requested, but the wrapped model is not a PEFT model")
+                peft_adapter_path = os.path.join(local_path, "peft_adapter")
+                local_mkdir_safe(peft_adapter_path)
+                unwrap_model.save_pretrained(peft_adapter_path)
+                log_with_rank(
+                    f"Saved PEFT adapter to {os.path.abspath(peft_adapter_path)}",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
 
             # Also save runtime FSDP config
             fsdp_config_path = os.path.join(local_path, "fsdp_config.json")

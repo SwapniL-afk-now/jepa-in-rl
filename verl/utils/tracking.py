@@ -203,8 +203,15 @@ class Tracking:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
     def log(self, data, step, backend=None):
+        wandb_skip_until = os.environ.get("WANDB_SKIP_UNTIL_STEP")
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
+                if default_backend in {"wandb", "tracking", "vemlp_wandb"} and wandb_skip_until:
+                    try:
+                        if step <= int(wandb_skip_until):
+                            continue
+                    except ValueError:
+                        pass
                 payload = _wandb_safe_data(data) if default_backend in {"wandb", "tracking", "vemlp_wandb"} else data
                 logger_instance.log(data=payload, step=step)
 
