@@ -193,6 +193,10 @@ class ActorConfig(BaseConfig):
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
+    # When True (and the update is a single on-policy optimizer step: ppo_epochs==1
+    # and ppo_mini_batch_size >= train_batch_size), skip the separate old_log_prob
+    # forward and let the loss default old_log_prob = log_prob.detach() (ratio == 1).
+    fuse_old_log_prob: bool = False
     shuffle: bool = False
     data_loader_seed: int = 1
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)

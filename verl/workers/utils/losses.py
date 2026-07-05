@@ -99,7 +99,13 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     wg_group_ids = _as_list(data.get("uid", None)) if wg_enabled else []
 
     # select fields and convert to padded tensor
-    fields = ["response_mask", "old_log_probs", "advantages"]
+    # old_log_probs is optional: when the trainer fuses the old-log-prob forward
+    # into the update (ppo_epochs==1 and a single optimizer step per batch), it is
+    # absent and we default it to log_prob.detach() below -> ratio == 1 exactly.
+    has_old_log_probs = "old_log_probs" in data
+    fields = ["response_mask", "advantages"]
+    if has_old_log_probs:
+        fields.append("old_log_probs")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -127,7 +133,10 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
     response_mask = data["response_mask"].to(bool)
     policy_response_mask = response_mask
     # compute policy loss
-    old_log_prob = data["old_log_probs"]
+    # When old_log_probs was not materialized (fused path), old == new so the PPO
+    # ratio is exactly 1.0 -- valid only for a single optimizer step (ppo_epochs==1
+    # and ppo_mini_batch_size >= train_batch_size), which the trainer enforces.
+    old_log_prob = data["old_log_probs"] if has_old_log_probs else log_prob.detach()
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
 

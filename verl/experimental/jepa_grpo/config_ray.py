@@ -39,6 +39,12 @@ class JEPARayConfig:
     # policy gradient). n_cot + n_code must equal rollout_n; see validate().
     n_cot: int = 4
     n_code: int = 4
+    # Also run a Code-view pass during validation and report val-code/* and
+    # val-dual/* (per-prompt CoT∪Code union) metrics alongside the existing
+    # CoT-only val/* keys. Doubles validation generation cost. The existing
+    # val/*, val-core/*, val-aux/* keys stay CoT-only so best-checkpoint
+    # selection semantics are unchanged.
+    dual_view_val: bool = True
     alpha: float = 0.1
     # Linearly ramp the EFFECTIVE alpha used in jepa_update from 0 -> `alpha`
     # over this many JEPA-update steps (0 = disabled, full `alpha` from step

@@ -30,7 +30,7 @@ from transformers.dynamic_module_utils import custom_object_save
 
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
-from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
+from verl.utils.fsdp_utils import collect_lora_params, fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
 from verl.utils.transformers_compat import drop_tied_target_keys, get_auto_model_for_vision2seq
 
@@ -307,19 +307,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if hasattr(model_config, "auto_map"):
                 custom_object_save(unwrap_model, hf_config_tokenizer_path, config=model_config)
 
-            if should_save_peft_adapter:
-                if not hasattr(unwrap_model, "save_pretrained") or not hasattr(unwrap_model, "peft_config"):
-                    raise RuntimeError("peft_adapter checkpoint requested, but the wrapped model is not a PEFT model")
-                peft_adapter_path = os.path.join(local_path, "peft_adapter")
-                local_mkdir_safe(peft_adapter_path)
-                unwrap_model.save_pretrained(peft_adapter_path)
-                log_with_rank(
-                    f"Saved PEFT adapter to {os.path.abspath(peft_adapter_path)}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
-
             # Also save runtime FSDP config
             fsdp_config_path = os.path.join(local_path, "fsdp_config.json")
             fsdp_config = FSDPConfig(
@@ -328,6 +315,38 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             )
             with open(fsdp_config_path, "w") as f:
                 json.dump(asdict(fsdp_config), f, indent=4)
+
+        if should_save_peft_adapter:
+            # Gathering LoRA adapter weights under FSDP is collective. Use the
+            # layered LoRA collector so adapter-only checkpoints do not all-gather
+            # the full base model.
+            if fsdp_version(self.model) == 1:
+                unwrap_model = self.model._fsdp_wrapped_module
+            else:
+                unwrap_model = self.model
+            if not hasattr(unwrap_model, "save_pretrained") or not hasattr(unwrap_model, "peft_config"):
+                raise RuntimeError("peft_adapter checkpoint requested, but the wrapped model is not a PEFT model")
+            try:
+                peft_state_dict = collect_lora_params(self.model, layered_summon=True, base_sync_done=True)
+            except Exception as exc:
+                warnings.warn(
+                    "Layered LoRA adapter collection failed; falling back to root FSDP summon. "
+                    f"Exception: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                peft_state_dict = collect_lora_params(self.model, layered_summon=False, base_sync_done=True)
+            if self.rank == 0:
+                peft_adapter_path = os.path.join(local_path, "peft_adapter")
+                local_mkdir_safe(peft_adapter_path)
+                unwrap_model.save_pretrained(peft_adapter_path, state_dict=peft_state_dict)
+                log_with_rank(
+                    f"Saved PEFT adapter to {os.path.abspath(peft_adapter_path)}",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+            del peft_state_dict
 
         # wait for everyone to dump to local
         torch.distributed.barrier()

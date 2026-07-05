@@ -837,7 +837,7 @@ class JEPAGRPOTrainer:
     def rollout_prompt_code(
         self, example: dict[str, Any], prompt_uid: str
     ) -> list[dict[str, Any]]:
-        """Generate G Code responses and score. No GRPO — reward-only for JEPA targets."""
+        """Generate G Code responses, score, compute old_logps, attach Dr.GRPO advantages."""
         problem = self._problem_from_example(example)
         messages = self.code_messages(problem)
         ground_truth = example["reward_model"]["ground_truth"]
@@ -850,17 +850,26 @@ class JEPAGRPOTrainer:
 
         items: list[dict[str, Any]] = []
         for gen_idx, response in enumerate(responses):
+            encoded = self.encode_prompt_response(messages, response)
             reward_result = compute_math_reward(response, ground_truth, dataset_kind=dataset_kind)
-            items.append({
+            item: dict[str, Any] = {
                 "response": response,
                 "generation_index": gen_idx,
                 "prompt_uid": prompt_uid,
                 "view": "code",
                 "problem": problem,
-                "completion_length": 0,
+                "encoded": encoded,
+                "completion_length": int(encoded["completion_length"]) if encoded else 0,
                 "generation_seconds": gen_secs,
                 **reward_result.__dict__,
-            })
+            }
+            if encoded is not None:
+                item["old_logps"] = self._detached_logps(encoded)
+            else:
+                item["old_logps"] = torch.zeros((0,), dtype=torch.float32)
+            items.append(item)
+
+        _attach_dr_grpo_advantages(items)
         return items
 
     def _problem_from_example(self, example: dict[str, Any]) -> str:
@@ -1075,7 +1084,11 @@ class JEPAGRPOTrainer:
         all_metrics: dict[str, float] = {}
 
         # ================================================================
-        # PHASE 1: Dr.GRPO loss on CoT responses (micro-batched)
+        # PHASE 1: Dr.GRPO loss on CoT + Code responses (micro-batched)
+        # Advantages are group-centered independently within each view (CoT
+        # group of N_COT, Code group of N_CODE); both views' rollouts are
+        # then pooled into one PG loss so code generations also get policy
+        # gradient signal, not just the JEPA alignment target.
         # ================================================================
         self.set_active_adapter(train=True)
 
@@ -1083,9 +1096,14 @@ class JEPAGRPOTrainer:
             item for items in cot_items_by_prompt for item in items
             if item.get("encoded") is not None and item.get("valid_token_count", 0) > 0
         ]
+        flat_code = [
+            item for items in code_items_by_prompt for item in items
+            if item.get("encoded") is not None and item.get("valid_token_count", 0) > 0
+        ]
+        flat_pg = flat_cot + flat_code
 
         grpo_accum: dict[str, list[float]] = {}
-        for chunk in self._micro_batches(flat_cot):
+        for chunk in self._micro_batches(flat_pg):
             encoded_items = [item["encoded"] for item in chunk]
             current_logps, _, _ = self.batch_completion_logprobs(self.policy_model, encoded_items)
             old_logps = self._concat_item_tensors(

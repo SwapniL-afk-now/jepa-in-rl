@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# DAPO | DeepSeek-R1-Distill-Qwen-1.5B | FSDP training | NVIDIA GPUs
-# Non-JEPA default DeepSeek DAPO entrypoint.
+# JEPA-DAPO | DeepSeek-R1-Distill-Qwen-1.5B | Ray + FSDP + hybrid-engine vLLM
+# DAPO with the JEPA/TCR-dual auxiliary objective enabled by default.
 # DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization, arXiv:2503.14476) keeps the
 # GRPO group-relative advantage (WITH std normalization, unlike Dr.GRPO) and adds:
 #   - Clip-Higher: decoupled clip epsilons (clip_ratio_low=0.2, clip_ratio_high=0.28) + clip_ratio_c
@@ -66,7 +66,7 @@ export WANDB_MODE=${WANDB_MODE:-online}
 MODEL_PATH=${MODEL_PATH:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
 TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
-NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
+NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-2}
 
 EVAL_DATA_DIR=${EVAL_DATA_DIR:-/workspace/jepa-grpo-cache/eval_data}
 PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
@@ -127,11 +127,13 @@ fi
 # On the local 96GB Blackwell GPU, 64 prompts x 8 rollouts gave the best tested utilization.
 TRAIN_PROMPT_BATCH_SIZE=${TRAIN_PROMPT_BATCH_SIZE:-64}
 NUM_GENERATIONS=${NUM_GENERATIONS:-8}
+N_COT=${N_COT:-4}
+N_CODE=${N_CODE:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}   # 8192-token generation budget; shared by train + eval via data.max_response_length
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}   # 3072-token generation budget; shared by train + eval via data.max_response_length
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}   # 65536 OOM'd during actor backward; activation memory, not just optimizer state, scales with this
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
 DAPO_USE_LORA=${DAPO_USE_LORA:-true}   # false -> full fine-tuning; set true to re-enable LoRA
@@ -149,11 +151,39 @@ CLIP_RATIO_C=${CLIP_RATIO_C:-10.0}
 USE_KL_LOSS=${USE_KL_LOSS:-false}
 KL_LOSS_COEF=${KL_LOSS_COEF:-0.0}
 
+# vLLM async-engine drain before back-to-back CoT/Code rollout RPCs.
+JEPA_VLLM_DRAIN_S=${JEPA_VLLM_DRAIN_S:-2}
+export JEPA_VLLM_DRAIN_S
+
+# JEPA/TCR-dual auxiliary objective.
+ALPHA=${ALPHA:-0.005}
+EMA_DECAY=${EMA_DECAY:-0.99}
+EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-8}
+MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-tcr-dual}
+JEPA_REWARD_BETA=${JEPA_REWARD_BETA:-0.5}
+JEPA_SIGMA_FLOOR=${JEPA_SIGMA_FLOOR:-0.1}
+TEACHER_CACHE=${TEACHER_CACHE:-/workspace/jepa-grpo-cache/teacher_targets.pt.responses.pt}
+CODE_TEACHER_CACHE=${CODE_TEACHER_CACHE:-/workspace/jepa-grpo-cache/code_teacher_targets.pt.responses.pt}
+TCR_MATCH=${TCR_MATCH:-cycle}
+SELF_CONSIST_W=${SELF_CONSIST_W:-1.0}
+AUTO_OFF_ENABLE=${AUTO_OFF_ENABLE:-True}
+AUTO_OFF_PATIENCE=${AUTO_OFF_PATIENCE:-20}
+AUTO_OFF_MIN_DELTA=${AUTO_OFF_MIN_DELTA:-0.002}
+AUTO_OFF_WARMUP=${AUTO_OFF_WARMUP:-20}
+AUTO_OFF_MIN_COS=${AUTO_OFF_MIN_COS:-0.0}
+JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
+LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
+TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.3}
+N_PROJECTIONS=${N_PROJECTIONS:-4096}
+JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
+ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}
+
 # DAPO overlong reward shaping (soft length penalty applied by the `dapo` reward manager).
 # Canonical DAPO uses a buffer of ~20% of max_response_length (official recipe: 4096/20480),
 # with the penalty ramping linearly from 0 to penalty_factor over that final window.
 ENABLE_OVERLONG_BUFFER=${ENABLE_OVERLONG_BUFFER:-true}
-OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-1638}          # ~20% of MAX_RESPONSE_LENGTH=8192 (matches DAPO's 4096/20480 ratio)
+OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-614}          # ~20% of MAX_RESPONSE_LENGTH=3072 (matches DAPO's 4096/20480 ratio)
 OVERLONG_PENALTY_FACTOR=${OVERLONG_PENALTY_FACTOR:-1.0}
 
 # DAPO dynamic sampling (group filtering). Canonical DAPO oversamples the generation
@@ -178,7 +208,7 @@ TRAIN_TOP_P=${TRAIN_TOP_P:-1.0}
 TRAIN_TOP_K=${TRAIN_TOP_K:--1}
 
 ROLLOUT_TP=${ROLLOUT_TP:-1}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.75}   # 0.75 left vLLM holding too much memory for the log_prob/backward passes alongside it
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}   # vLLM KV-cache fraction; 0.7+ OOM'd at sleep/wake weight-sync under fsdp_size=1 (full replica per GPU)
 # ROLLOUT_N matches NUM_GENERATIONS for consistency
 ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
@@ -190,27 +220,42 @@ VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
 VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[31415,27182,16180]'}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
-MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-400}   # fixed-length run on dapo-math-17k
+MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-800}   # fixed-length run on dapo-math-17k
 SAVE_FREQ=${SAVE_FREQ:-20}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}   # catches val-path bugs/crashes immediately instead of after test_freq steps
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
 
-PROJECT_NAME=${PROJECT_NAME:-dapo_deepseek_1.5B}
+PROJECT_NAME=${PROJECT_NAME:-dapo_jepa}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
+MODEL_NAME=${MODEL_NAME:-$(basename "${MODEL_PATH}")}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
 ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-null}
 VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-null}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-deepseek_r1_distill_qwen_1_5b_dapo-${RUN_TIMESTAMP}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-dapo_jepa-${MODEL_NAME}-${RUN_TIMESTAMP}}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 ########################### end user-adjustable ###########################
+
+if (( N_COT + N_CODE != ROLLOUT_N )); then
+    echo "N_COT (${N_COT}) + N_CODE (${N_CODE}) must equal ROLLOUT_N (${ROLLOUT_N})" >&2
+    exit 1
+fi
+
+for c in "${TEACHER_CACHE}" "${CODE_TEACHER_CACHE}"; do
+    if [[ ! -f "${c}" ]]; then
+        echo "Missing JEPA teacher cache: ${c}" >&2
+        echo "Download/copy it into /workspace/jepa-grpo-cache or override TEACHER_CACHE/CODE_TEACHER_CACHE." >&2
+        exit 1
+    fi
+done
 
 ########################### parameter arrays ###########################
 
 DATA=(
     algorithm.adv_estimator=grpo
+    algorithm.norm_adv_by_std_in_grpo=True
     algorithm.use_kl_in_reward=False
     data.train_files="$TRAIN_FILE"
     data.val_files=${VAL_FILES}
@@ -235,7 +280,7 @@ fi
 MODEL=(
     actor_rollout_ref.model.path="$MODEL_PATH"
     actor_rollout_ref.model.use_remove_padding=True
-    actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.model.enable_gradient_checkpointing=${ENABLE_GRAD_CKPT:-False}
     +actor_rollout_ref.model.override_config.attn_implementation=${ACTOR_ATTENTION_IMPL}
 )
 
@@ -283,6 +328,34 @@ ROLLOUT=(
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
 )
 
+JEPA=(
+    jepa.enable=${JEPA_ENABLE:-True}
+    jepa.n_cot=${N_COT}
+    jepa.n_code=${N_CODE}
+    jepa.alpha=${ALPHA}
+    jepa.ema_decay=${EMA_DECAY}
+    jepa.embed_micro_batch_size=${EMBED_MICRO_BATCH_SIZE}
+    jepa.min_valid_pairs=${MIN_VALID_PAIRS}
+    jepa.loss_type=${JEPA_LOSS_TYPE}
+    jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
+    jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}
+    jepa.n_projections=${N_PROJECTIONS}
+    jepa.alpha_warmup_steps=${ALPHA_WARMUP_STEPS}
+    jepa.max_grad_norm=${JEPA_MAX_GRAD_NORM}
+    jepa.teacher_cache_path=${TEACHER_CACHE}
+    jepa.code_teacher_cache_path=${CODE_TEACHER_CACHE}
+    jepa.tcr_match=${TCR_MATCH}
+    jepa.jepa_anchor_set=${JEPA_ANCHOR_SET}
+    jepa.self_consist_w=${SELF_CONSIST_W}
+    jepa.tcr_reward_beta=${JEPA_REWARD_BETA}
+    jepa.tcr_reward_sigma_floor=${JEPA_SIGMA_FLOOR}
+    jepa.auto_off_enable=${AUTO_OFF_ENABLE}
+    jepa.auto_off_patience=${AUTO_OFF_PATIENCE}
+    jepa.auto_off_min_delta=${AUTO_OFF_MIN_DELTA}
+    jepa.auto_off_warmup_steps=${AUTO_OFF_WARMUP}
+    jepa.auto_off_min_cos=${AUTO_OFF_MIN_COS}
+)
+
 REF=(
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
@@ -325,11 +398,13 @@ EXTRA=(
 )
 
 ########################### launch ###########################
-VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND} python3 -m verl.trainer.main_ppo \
+VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND} python3 -m verl.experimental.jepa_grpo.main_ray \
+    --config-name jepa_grpo_ray_qwen25_1_5b \
     "${DATA[@]}" \
     "${MODEL[@]}" \
     "${ACTOR[@]}" \
     "${ROLLOUT[@]}" \
+    "${JEPA[@]}" \
     "${REF[@]}" \
     "${REWARD[@]}" \
     "${TRAINER[@]}" \

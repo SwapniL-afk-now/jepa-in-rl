@@ -64,6 +64,20 @@ class DAPORewardManager(RewardManagerBase):
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
         )
+
+        # JEPA-GRPO Code view: the response is a Python PROGRAM, not a solution
+        # text — string-matching its source can't measure correctness. Rows are
+        # tagged by _tokenize_code_prompts (extra_info["view"]=="code"); execute
+        # the program and score its printed answer with the same math verifier.
+        if isinstance(extra_info, dict) and extra_info.get("view") == "code":
+            from verl.experimental.jepa_grpo.code_exec import score_code_response
+
+            result = await self.loop.run_in_executor(
+                None,
+                lambda: score_code_response(response_str, ground_truth, data_source=data_source),
+            )
+            return self._finalize(result, valid_response_length)
+
         extra_reward_kwargs = (
             {
                 "reward_router_address": self.reward_router_address,
@@ -92,6 +106,11 @@ class DAPORewardManager(RewardManagerBase):
                 ),
             )
 
+        return self._finalize(result, valid_response_length)
+
+    def _finalize(self, result, valid_response_length) -> dict:
+        """Shared tail of run_single: unpack the score dict and apply the
+        DAPO overlong-buffer penalty."""
         reward_extra_info = {}
 
         score: float

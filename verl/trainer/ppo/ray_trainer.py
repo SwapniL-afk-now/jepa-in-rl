@@ -1311,6 +1311,7 @@ class RayPPOTrainer:
             metric = str(self.config.trainer.get("best_ckpt_metric", "combined")).lower()
             entries = [(metric, "best")]
 
+        improved = []
         for metric, dir_name in entries:
             combined, avg_at_k, pass_at_k = self._score_for_metric(metric, val_metrics, best_ckpt_sources)
             if combined is None:
@@ -1326,52 +1327,73 @@ class RayPPOTrainer:
                     f"metric={metric} score={combined:.4f} (avg@k={avg_s}, pass@k={pass_s}) "
                     f"over {best_ckpt_sources}"
                 )
-                best_local_path = os.path.join(self.config.trainer.default_local_dir, dir_name, "actor")
-                self.actor_rollout_wg.save_checkpoint(
-                    best_local_path,
-                    None,
-                    self.global_steps,
-                    max_ckpt_to_keep=1,
-                    tag=dir_name,
-                    save_contents=["peft_adapter", "extra"],
-                )
-                avg_w = f"{avg_at_k:.6f}" if avg_at_k is not None else "nan"
-                pass_w = f"{pass_at_k:.6f}" if pass_at_k is not None else "nan"
-                best_dir = os.path.join(self.config.trainer.default_local_dir, dir_name)
-                with open(os.path.join(best_dir, "best_val_acc.txt"), "w") as f:
-                    f.write(
-                        f"step={self.global_steps} metric={metric} score={combined:.6f} "
-                        f"avg_at_k={avg_w} pass_at_k={pass_w} sources={best_ckpt_sources}\n"
-                    )
+                improved.append((metric, dir_name, combined, avg_at_k, pass_at_k))
 
-                seeds = self._parse_validation_seeds()
-                field = None
-                if "@" in metric and metric.split("@", 1)[0] in ("avg", "pass"):
-                    kind, _, budget = metric.partition("@")
-                    field = f"{kind}_at_{budget}"
-                seed_values = {}
-                if field and seeds:
-                    for seed in seeds:
-                        values = [
-                            val_metrics[f"val/{source}/{field}/seed_{seed}"]
-                            for source in best_ckpt_sources
-                            if f"val/{source}/{field}/seed_{seed}" in val_metrics
-                        ]
-                        if values:
-                            seed_values[str(seed)] = float(sum(values) / len(values))
-                metadata = {
-                    "selected_metric": metric,
-                    "global_step": int(self.global_steps),
-                    "benchmark_sources": list(best_ckpt_sources),
-                    "seed_list": seeds,
-                    "per_seed_values": seed_values,
-                    "mean_score": float(combined),
-                    "std_score": float(np.asarray(list(seed_values.values()), dtype=float).std()) if seed_values else 0.0,
-                    "avg_at_k": None if avg_at_k is None else float(avg_at_k),
-                    "pass_at_k": None if pass_at_k is None else float(pass_at_k),
-                }
-                with open(os.path.join(best_dir, "best_metadata.json"), "w") as f:
-                    json.dump(metadata, f, indent=2, sort_keys=True)
+        if not improved:
+            return
+
+        saved_actor_path = None
+        self.checkpoint_manager.sleep_replicas()
+        try:
+            for idx, (metric, dir_name, _combined, _avg_at_k, _pass_at_k) in enumerate(improved):
+                best_local_path = os.path.join(self.config.trainer.default_local_dir, dir_name, "actor")
+                if idx == 0 or saved_actor_path is None or not os.path.exists(saved_actor_path):
+                    self.actor_rollout_wg.save_checkpoint(
+                        best_local_path,
+                        None,
+                        self.global_steps,
+                        max_ckpt_to_keep=1,
+                        tag=dir_name,
+                        save_contents=["peft_adapter", "extra"],
+                    )
+                    saved_actor_path = best_local_path
+                else:
+                    if os.path.exists(best_local_path):
+                        shutil.rmtree(best_local_path)
+                    shutil.copytree(saved_actor_path, best_local_path)
+                    print(f"Copied best checkpoint actor payload to [{dir_name}] from [{improved[0][1]}]")
+        finally:
+            self.checkpoint_manager.update_weights(self.global_steps)
+
+        for metric, dir_name, combined, avg_at_k, pass_at_k in improved:
+            avg_w = f"{avg_at_k:.6f}" if avg_at_k is not None else "nan"
+            pass_w = f"{pass_at_k:.6f}" if pass_at_k is not None else "nan"
+            best_dir = os.path.join(self.config.trainer.default_local_dir, dir_name)
+            os.makedirs(best_dir, exist_ok=True)
+            with open(os.path.join(best_dir, "best_val_acc.txt"), "w") as f:
+                f.write(
+                    f"step={self.global_steps} metric={metric} score={combined:.6f} "
+                    f"avg_at_k={avg_w} pass_at_k={pass_w} sources={best_ckpt_sources}\n"
+                )
+
+            seeds = self._parse_validation_seeds()
+            field = None
+            if "@" in metric and metric.split("@", 1)[0] in ("avg", "pass"):
+                kind, _, budget = metric.partition("@")
+                field = f"{kind}_at_{budget}"
+            seed_values = {}
+            if field and seeds:
+                for seed in seeds:
+                    values = [
+                        val_metrics[f"val/{source}/{field}/seed_{seed}"]
+                        for source in best_ckpt_sources
+                        if f"val/{source}/{field}/seed_{seed}" in val_metrics
+                    ]
+                    if values:
+                        seed_values[str(seed)] = float(sum(values) / len(values))
+            metadata = {
+                "selected_metric": metric,
+                "global_step": int(self.global_steps),
+                "benchmark_sources": list(best_ckpt_sources),
+                "seed_list": seeds,
+                "per_seed_values": seed_values,
+                "mean_score": float(combined),
+                "std_score": float(np.asarray(list(seed_values.values()), dtype=float).std()) if seed_values else 0.0,
+                "avg_at_k": None if avg_at_k is None else float(avg_at_k),
+                "pass_at_k": None if pass_at_k is None else float(pass_at_k),
+            }
+            with open(os.path.join(best_dir, "best_metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

@@ -37,6 +37,10 @@ def _get_unique_tensor_key(tensor):
     return key
 
 
+def _tensor_can_be_cpu_offloaded(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and tensor.layout == torch.strided and tensor.is_contiguous()
+
+
 class FSDPParameterFilter:
     def __init__(self):
         self.model_parameters_storage = set()
@@ -198,7 +202,11 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
         tensor_tag = (self.current_group, self.tensor_count_current_group)
         self.tensor_count_current_group += 1
         assert tensor_tag not in self.tensor_tag_to_state
-        if self.current_group < self.num_offload_group and self.tensor_need_offloading_checker(tensor):
+        if (
+            self.current_group < self.num_offload_group
+            and self.tensor_need_offloading_checker(tensor)
+            and _tensor_can_be_cpu_offloaded(tensor)
+        ):
             state = SynchronizedGroupOffloadHandler.offload(tensor)
             self.tensor_tag_to_state[tensor_tag] = state
         else:
@@ -266,7 +274,9 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
             torch._subclasses.fake_tensor.FakeTensor | torch._subclasses.functional_tensor.FunctionalTensor,
         )
         need_offload = not torch_stray_tensor
-        need_offload = need_offload and self.tensor_need_offloading_checker(tensor)
+        need_offload = (
+            need_offload and self.tensor_need_offloading_checker(tensor) and _tensor_can_be_cpu_offloaded(tensor)
+        )
 
         if need_offload:
             # obtain a unique tensor tag

@@ -166,11 +166,209 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # Copy metadata needed by the reward fn
         code_batch.non_tensor_batch.update({
             k: v for k, v in batch.non_tensor_batch.items()
-            if k in {"uid", "extra_info", "data_source", "reward_model"}
+            if k in {"uid", "data_source", "reward_model"}
         })
+        # Tag rows as code-view via extra_info so the reward manager
+        # (reward_loop/reward_manager/dapo.py) EXECUTES the program and scores
+        # its printed answer instead of string-matching the source. COPY each
+        # dict: the originals are shared by reference with the CoT batch.
+        code_batch.non_tensor_batch["extra_info"] = np.array(
+            [
+                {**info, "view": "code"} if isinstance(info, dict) else info
+                for info in batch.non_tensor_batch["extra_info"]
+            ],
+            dtype=object,
+        )
         code_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         code_batch.meta_info["global_steps"] = batch.meta_info.get("global_steps", 0)
         return code_batch
+
+    # ------------------------------------------- dual-view validation -------
+    def _validate_once(self, merged: bool = False, seed: int | None = None):
+        """CoT validation (parent) plus an extra Code-view pass.
+
+        Training pass@K pools 4 CoT + 4 Code rollouts per prompt, but the stock
+        `_validate_once` is CoT-only, so val pass@K was not measuring the same
+        quantity. This override keeps every existing CoT-only key (`val/*`,
+        `val-core/*`, `val-aux/*` — best-checkpoint selection reads those, so
+        its semantics are unchanged) and ADDS:
+
+          - ``val-code/{source}/*``: grouped metrics over the Code-view samples.
+          - ``val-dual/{source}/*``: per-prompt UNION of both views. Rows are
+            interleaved cot,code,cot,code,... so with val n=8 per view,
+            ``pass_at_8`` reads "4 CoT + 4 Code" (directly comparable to
+            train/pass_at_8) and ``pass_at_16`` is the full 8+8 union.
+
+        The two passes iterate `val_dataloader` independently; prompts are
+        matched by dataloader order (the val dataloader is sequential). If the
+        two passes disagree on prompt count or data_source order, the union
+        metrics are skipped with a warning rather than reported misaligned.
+        """
+        # Deliberately NOT gated on jepa_cfg.enable: enable=False only turns off
+        # the shaping/aux-loss arms, while the Code view keeps being rolled out
+        # and trained on (n_code > 0), so val must keep measuring it.
+        dual = bool(self.jepa_cfg.n_code > 0
+                    and getattr(self.jepa_cfg, "dual_view_val", False))
+        if merged or not dual:
+            return super()._validate_once(merged=merged, seed=seed)
+
+        # ── CoT pass: parent loop, raw per-sample results, then the exact
+        # same metric computation the non-merged parent path performs. ──
+        cot_raw = super()._validate_once(merged=True, seed=seed)
+        if not cot_raw.get("data_sources"):
+            return {}
+        cot_ds = [str(s) for s in np.concatenate(cot_raw["data_sources"], axis=0)]
+        cot_uids = [str(u) for u in cot_raw["sample_uids"]]
+        cot_extra = cot_raw["reward_extra_infos_dict"]
+        metric_dict = self._val_metrics_update(
+            np.array(cot_ds, dtype=object), cot_uids, cot_extra, cot_raw["sample_turns"]
+        )
+
+        acc_src = cot_extra.get("acc") or cot_extra.get("score") or cot_extra.get("reward") or []
+        cot_acc = [float(a) for a in acc_src]
+        cot_pred = [str(p) for p in cot_extra.get("pred", [])]
+        if len(cot_acc) != len(cot_uids):
+            logger.warning("dual-view val: CoT acc/uid length mismatch; skipping code view")
+            return metric_dict
+
+        code = self._validate_code_view(seed=seed)
+        if code is None:
+            return metric_dict
+
+        metric_dict.update(self._compute_grouped_accuracy_metrics(
+            code["ds"], code["uid"],
+            {"acc": code["acc"], "score": code["acc"], "pred": code["pred"]},
+            prefix="val-code", outputs=code["out"],
+        ))
+
+        # ── Union: group each pass's rows by first-seen uid order, pair
+        # prompts positionally, interleave rows cot,code,cot,code,... ──
+        def _first_seen(uids_list):
+            order, rows = [], defaultdict(list)
+            for i, u in enumerate(uids_list):
+                if u not in rows:
+                    order.append(u)
+                rows[u].append(i)
+            return order, rows
+
+        cot_order, cot_rows = _first_seen(cot_uids)
+        code_order, code_rows = _first_seen(code["uid"])
+        if len(cot_order) != len(code_order):
+            logger.warning(
+                "dual-view val: prompt count mismatch (cot=%d code=%d); skipping val-dual",
+                len(cot_order), len(code_order),
+            )
+            return metric_dict
+
+        have_pred = len(cot_pred) == len(cot_uids)
+        dual_ds, dual_uid, dual_acc, dual_pred = [], [], [], []
+        from itertools import zip_longest
+        for u_c, u_k in zip(cot_order, code_order):
+            ci, ki = cot_rows[u_c], code_rows[u_k]
+            if cot_ds[ci[0]] != code["ds"][ki[0]]:
+                logger.warning(
+                    "dual-view val: data_source order mismatch (%s vs %s); skipping val-dual",
+                    cot_ds[ci[0]], code["ds"][ki[0]],
+                )
+                return metric_dict
+            for a, b in zip_longest(ci, ki):
+                if a is not None:
+                    dual_uid.append(u_c)
+                    dual_ds.append(cot_ds[a])
+                    dual_acc.append(cot_acc[a])
+                    if have_pred:
+                        dual_pred.append(cot_pred[a])
+                if b is not None:
+                    dual_uid.append(u_c)
+                    dual_ds.append(code["ds"][b])
+                    dual_acc.append(code["acc"][b])
+                    if have_pred:
+                        dual_pred.append(code["pred"][b])
+
+        metric_dict.update(self._compute_grouped_accuracy_metrics(
+            dual_ds, dual_uid,
+            {"acc": dual_acc, "score": dual_acc, "pred": dual_pred},
+            prefix="val-dual",
+        ))
+        return metric_dict
+
+    def _validate_code_view(self, seed: int | None = None) -> dict | None:
+        """Generate + score one Code-view pass over the whole val set.
+
+        Mirrors the generation/reward mechanics of the parent `_validate_once`
+        loop (same val_kwargs sampling, same padding, same reward extraction),
+        with the prompt rebuilt through `_tokenize_code_prompts` so the system
+        prompt matches the training-time code view.
+        """
+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+        from verl.trainer.ppo.reward import extract_reward
+
+        # Same back-to-back vLLM RPC drain guard as fit()'s cot->code handoff.
+        import time as _time
+        _time.sleep(float(os.environ.get("JEPA_VLLM_DRAIN_S", "5")))
+
+        n_val = self.config.actor_rollout_ref.rollout.val_kwargs.n
+        uids, dss, accs, preds, outs = [], [], [], [], []
+        for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+            test_batch = test_batch.repeat(repeat_times=n_val, interleave=True)
+
+            code_gen_batch = self._tokenize_code_prompts(test_batch)
+            # Replace train-time meta (temperature) with the parent's val meta
+            # so the rollout uses val_kwargs sampling, exactly like the CoT pass.
+            code_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+            }
+            if seed is not None:
+                code_gen_batch.meta_info["seed"] = int(seed)
+
+            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            padded, pad_size = pad_dataproto_to_divisor(code_gen_batch, size_divisor)
+            out_padded = self.async_rollout_manager.generate_sequences(padded)
+            out = unpad_dataproto(out_padded, pad_size=pad_size)
+            # Same union-hygiene as fit(): drop per-call keys that would
+            # collide or end up length-mismatched.
+            out.meta_info.pop("timing", None)
+            out.non_tensor_batch.pop("raw_prompt", None)
+            out.non_tensor_batch.pop("uid", None)
+
+            test_batch = test_batch.union(out)
+            test_batch.meta_info["validate"] = True
+            reward_tensor, reward_extra = extract_reward(test_batch)
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            n_rows = len(scores)
+
+            acc_vals = reward_extra.get("acc")
+            if acc_vals is not None and len(acc_vals) == n_rows:
+                acc_list = [float(a) for a in acc_vals]
+            else:
+                acc_list = [float(s) for s in scores]
+            pred_vals = reward_extra.get("pred")
+            if pred_vals is not None and len(pred_vals) == n_rows:
+                pred_list = [str(p) if p is not None else "<unparsed>" for p in pred_vals]
+            else:
+                pred_list = ["<unparsed>"] * n_rows
+
+            uids.extend(str(u) for u in test_batch.non_tensor_batch["uid"])
+            dss.extend(
+                str(s) for s in test_batch.non_tensor_batch.get("data_source", ["unknown"] * n_rows)
+            )
+            accs.extend(acc_list)
+            preds.extend(pred_list)
+            outs.extend(self.tokenizer.batch_decode(test_batch.batch["responses"], skip_special_tokens=True))
+
+        if not uids:
+            return None
+        return {"uid": uids, "ds": dss, "acc": accs, "pred": preds, "out": outs}
 
     # --------------------------------------- JEPA batch construction --------
     @staticmethod
@@ -187,6 +385,45 @@ class JEPARayPPOTrainer(RayPPOTrainer):
             if line and re.match(r"^-?\d", line):
                 return line
         return response.strip()
+
+    def _compute_train_comparison_metrics(self, batch: DataProto) -> dict[str, float | int]:
+        """Compute train pass@K from raw verifier correctness, grouped across views.
+
+        JEPA/TCR reward shaping can make a sequence's shaped reward positive even
+        when the math/code verifier marked it wrong. Training pass@K should answer
+        "did any of the 4 CoT + 4 Code samples solve the prompt?", so it must use
+        raw verifier `acc` and the shared prompt `uid`, not shaped token rewards.
+        """
+        raw_acc = batch.non_tensor_batch.get("acc", None)
+        if raw_acc is None or len(raw_acc) != len(batch):
+            return super()._compute_train_comparison_metrics(batch)
+
+        acc_values = [float(v) for v in raw_acc]
+        uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [])]
+        data_sources = [str(src) for src in batch.non_tensor_batch.get("data_source", ["unknown"] * len(acc_values))]
+        preds = [str(pred if pred is not None else "<unparsed>") for pred in batch.non_tensor_batch.get("pred", [])]
+        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+        reward_extra = {"acc": acc_values, "score": acc_values, "pred": preds}
+
+        grouped = self._compute_grouped_accuracy_metrics(
+            data_sources, uids, reward_extra, prefix="train-dataset", outputs=outputs
+        )
+        correct_count = sum(float(v > 0.0) for v in acc_values)
+        total = len(acc_values)
+        metrics: dict[str, float | int] = {
+            "train/accuracy": float(correct_count / total) if total else 0.0,
+            "train/failure_rate": float(1.0 - (correct_count / total)) if total else 0.0,
+            "train/correct_count": int(correct_count),
+            "train/response_count": int(total),
+        }
+        groups = self._compute_grouped_accuracy_metrics(
+            ["all"] * len(uids), uids, reward_extra, prefix="train", outputs=outputs
+        )
+        for key, value in groups.items():
+            if key.startswith("train/all/"):
+                metrics[key.replace("train/all/", "train/")] = value
+        metrics.update(grouped)
+        return metrics
 
     @staticmethod
     def _group_rows_by_uid(
@@ -850,9 +1087,53 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                     if self.use_rm and "rm_scores" not in batch.batch.keys():
                         batch = batch.union(self._compute_reward_colocate(batch))
                     reward_tensor, reward_extra_infos = extract_reward(batch)
+                    if reward_extra_infos:
+                        for key, values in reward_extra_infos.items():
+                            if len(values) == len(batch):
+                                batch.non_tensor_batch[key] = np.array(values, dtype=object)
                     batch.batch["token_level_scores"] = reward_tensor
                     if not self.config.algorithm.use_kl_in_reward:
-                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        # clone(): Step 2.5's TCR shaping adds beta*s_hat to
+                        # token_level_rewards IN-PLACE; without the copy that
+                        # write aliases token_level_scores AND reward_tensor,
+                        # contaminating cot/code pass_at_1, avg_reward and the
+                        # JEPA "correct"-anchor selection (rew > 0) downstream.
+                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"].clone()
+
+                # ── Step 2.2: DAPO dynamic sampling (group filter) ──────
+                # The dataloader yields gen_batch_size prompts; keep only up to
+                # train_batch_size "mixed" uid-groups (>=1 correct AND >=1 wrong
+                # across the group's 4 CoT + 4 Code rows) — same
+                # _filter_dapo_groups the parent fit applies. Without this the
+                # step trained on the full unfiltered gen batch: ~70% zero-
+                # advantage all-wrong groups AND >train_batch_size groups,
+                # silently violating fuse_old_log_prob's single-optimizer-step
+                # assumption. Raw pre-filter rates are logged as train_raw/* so
+                # true model progress stays visible next to the (by-construction
+                # higher) post-filter train/accuracy.
+                with simple_timer("dapo_filter", timing_raw):
+                    raw_acc_col = batch.non_tensor_batch.get("acc", None)
+                    if raw_acc_col is not None and len(raw_acc_col) == len(batch):
+                        raw_correct = np.array([float(a) > 0.0 if a is not None else False for a in raw_acc_col])
+                    else:
+                        raw_correct = (reward_tensor.sum(dim=-1) > 0).cpu().numpy()
+                    raw_uids = batch.non_tensor_batch["uid"]
+                    uid_any_correct: dict = {}
+                    for u, c in zip(raw_uids, raw_correct):
+                        uid_any_correct[u] = uid_any_correct.get(u, False) or bool(c)
+                    metrics["train_raw/accuracy"] = float(raw_correct.mean()) if len(raw_correct) else 0.0
+                    metrics["train_raw/pass_at_8"] = (
+                        float(sum(uid_any_correct.values()) / len(uid_any_correct)) if uid_any_correct else 0.0
+                    )
+                    metrics["train_raw/response_count"] = float(len(batch))
+
+                    reward_extra_infos_dict = {
+                        k: list(batch.non_tensor_batch[k]) for k in ("acc",) if k in batch.non_tensor_batch
+                    }
+                    batch, reward_tensor, reward_extra_infos_dict, dapo_filter_metrics = self._filter_dapo_groups(
+                        batch, reward_tensor, reward_extra_infos_dict
+                    )
+                    metrics.update(dapo_filter_metrics)
 
                 # Sleep rollout replicas BEFORE the TCR-shaping forward (Step 2.5) and
                 # old_log_prob so vLLM releases its KV reservation before the actor runs the
@@ -923,10 +1204,32 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                 # Actor/FSDP-only (compute_log_prob); does NOT call vLLM. All rollout outputs
                 # it reads are already materialized in `batch` (DataProto.concat in Step 1),
                 # so sleeping vLLM first is safe.
+                #
+                # Fused path: when the update is a single on-policy optimizer step
+                # (ppo_epochs==1 and ppo_mini_batch_size >= train_batch_size), the
+                # old log-probs equal the log-probs the update forward recomputes on
+                # the same weights, so the PPO ratio is identically 1.0. In that case
+                # we skip this whole extra forward over all rollout tokens and let the
+                # loss default old_log_prob = log_prob.detach() (see losses.py).
+                actor_cfg = self.config.actor_rollout_ref.actor
+                _fuse = bool(actor_cfg.get("fuse_old_log_prob", False))
+                _single_opt_step = (
+                    int(actor_cfg.ppo_epochs) == 1
+                    and int(actor_cfg.ppo_mini_batch_size) >= int(self.config.data.train_batch_size)
+                )
+                fuse_old_log_prob = _fuse and _single_opt_step
+                if _fuse and not _single_opt_step:
+                    print(
+                        "[fuse_old_log_prob] disabled: requires ppo_epochs==1 and "
+                        f"ppo_mini_batch_size ({actor_cfg.ppo_mini_batch_size}) >= "
+                        f"train_batch_size ({self.config.data.train_batch_size}); "
+                        "falling back to a separate old_log_prob forward."
+                    )
                 self._log_gpu_mem("before_old_log_prob")
                 with simple_timer("old_log_prob", timing_raw):
-                    old_log_prob, _old_log_prob_mfu = self._compute_old_log_prob(batch)
-                    batch = batch.union(old_log_prob)
+                    if not fuse_old_log_prob:
+                        old_log_prob, _old_log_prob_mfu = self._compute_old_log_prob(batch)
+                        batch = batch.union(old_log_prob)
                     if self.use_reference_policy:
                         ref_log_prob = self._compute_ref_log_prob(batch)
                         batch = batch.union(ref_log_prob)

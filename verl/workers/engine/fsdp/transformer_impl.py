@@ -1197,6 +1197,11 @@ class FSDPEngine(BaseEngine):
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.module)
+        # The state-dict gathers above leave large freed blocks cached in this
+        # process's allocator; release them so the co-resident vLLM server can
+        # allocate during the next rollout (device is otherwise at capacity).
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs

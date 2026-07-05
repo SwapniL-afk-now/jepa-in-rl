@@ -14,6 +14,7 @@
 
 import json
 import os
+import sysconfig
 
 from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 
@@ -24,14 +25,37 @@ _major, _ = get_device_capability()
 # Megatron all_gather (mbridge export_weights) when NCCL tries to use NVLS/MNNVL.
 # Disable both on Blackwell (SM 10.x); non-Blackwell GPUs don't have MNNVL.
 _gb200_nccl_env = {"NCCL_NVLS_ENABLE": "0", "NCCL_MNNVL_ENABLE": "0"} if (_major or 0) >= 10 else {}
+if (_major or 0) >= 10:
+    # WAR: on RTX PRO 6000 Blackwell Max-Q (PCIe, no NVLink) the P2P and SHM NCCL
+    # transports fault with "CUDA error: an illegal memory access" on the first
+    # collective. Forcing the socket transport (both P2P and SHM disabled) is the
+    # only combination that completes an all_reduce here. Honor explicit overrides
+    # so NVLink-equipped Blackwell (e.g. GB200) can keep the fast transports.
+    _gb200_nccl_env["NCCL_P2P_DISABLE"] = os.environ.get("NCCL_P2P_DISABLE", "1")
+    _gb200_nccl_env["NCCL_SHM_DISABLE"] = os.environ.get("NCCL_SHM_DISABLE", "1")
 
-_venv_site_packages = "/venv/main/lib/python3.12/site-packages"
+# Use the site-packages of the interpreter actually running this process, so Ray
+# workers inherit the same venv as the driver. Hardcoding a specific venv path
+# (e.g. /venv/main) shadows the active env and can inject an incompatible numpy
+# ahead of it on PYTHONPATH (breaks numba/scipy in the vLLM workers).
+_venv_site_packages = sysconfig.get_paths().get("purelib", "")
 _verl_repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _extra_pythonpath = f"{_venv_site_packages}:{_verl_repo}"
 
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
+        # Degenerate rollouts can emit integers longer than CPython's default 4300-digit
+        # int<->str conversion limit, which crashes the math reward parser with a
+        # ValueError. Disable the limit for rollout/reward workers (0 = unlimited);
+        # the reward path has its own timeout so pathological inputs can't hang it.
+        "PYTHONINTMAXSTRDIGITS": os.environ.get("PYTHONINTMAXSTRDIGITS", "0"),
+        # ABI shim: torch 2.11 renamed c10::cuda::c10_cuda_check_implementation's
+        # line-number param from int -> unsigned int, breaking the prebuilt flash_attn
+        # 2.8.3 .so (and vLLM's optional flash_attn rotary import). libabishim.so
+        # defines the missing int-signature symbol, forwarding to torch's unsigned one.
+        # Preload it into every worker so flash_attn loads on the torch-2.11 stack.
+        **({"LD_PRELOAD": os.environ["LD_PRELOAD"]} if os.environ.get("LD_PRELOAD") else {}),
         "NCCL_DEBUG": "WARN",
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
@@ -74,7 +98,7 @@ def get_ppo_ray_runtime_env():
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
     # Ray workers don't inherit the driver's os.environ; pass these explicitly
-    for key in ("WANDB_API_KEY", "HF_TOKEN"):
+    for key in ("WANDB_API_KEY", "HF_TOKEN", "LD_PRELOAD"):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

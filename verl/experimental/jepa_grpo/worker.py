@@ -57,6 +57,26 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         # Initialised lazily on first jepa_init call so config is available
         self.ema_weights: Optional[dict[str, torch.Tensor]] = None
         self.jepa_cfg: Optional[JEPARayConfig] = None
+        # JEPA_UPDATE_NO_GC=1: run the GRPO actor update WITHOUT gradient
+        # checkpointing (skips the full recompute pass, ~25-35% faster update)
+        # while keeping GC enabled for every other phase — the JEPA GradCache
+        # backward genuinely needs it. Toggled around train_mini_batch only.
+        import os as _os
+        if _os.environ.get("JEPA_UPDATE_NO_GC", "0") == "1" and hasattr(self, "actor"):
+            _orig_tmb = self.actor.train_mini_batch
+
+            def _tmb_no_gc(data, _orig=_orig_tmb):
+                m = self.actor.engine.module  # FSDP/PEFT forward getattr to the HF model
+                m.gradient_checkpointing_disable()
+                try:
+                    return _orig(data)
+                finally:
+                    m.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+
+            self.actor.train_mini_batch = _tmb_no_gc
+            print("[JEPA_UPDATE_NO_GC] gradient checkpointing disabled for update_actor only")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def jepa_init(self, jepa_cfg_dict: dict) -> None:
@@ -345,6 +365,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                     attention_mask=packed_attn,
                     position_ids=packed_pos,
                     use_cache=False,
+                    return_dict=True,  # required by the fused-kernels patched forward
                     # Only the anchor scalar below needs *a* logits tensor, not the
                     # full (N, max_rlen, vocab) one HF computes by default (logits_to_keep=0).
                     # With long packed batches this materializes tens of GB just to be
@@ -366,7 +387,15 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         # skips the root FSDP output, leaving its state machine in an
         # inconsistent state that causes cudaErrorIllegalAddress.
         # The multiplier is exactly 0.0 so this contributes zero gradient.
-        logits_anchor = outputs.logits[:, 0, 0].sum() * 0.0
+        # With model.use_fused_kernels=True the patched forward returns
+        # CausalLMOutputForPPO (log_probs/entropy, no logits tensor); anchor on
+        # log_probs in that case — any root-forward output tensor works.
+        _anchor_src = getattr(outputs, "logits", None)
+        if _anchor_src is not None:
+            logits_anchor = _anchor_src[:, 0, 0].sum() * 0.0
+        else:
+            # shape varies by backend ((N, T) torch vs flat (N*T,) triton) — stay agnostic
+            logits_anchor = outputs.log_probs.reshape(-1)[0].sum() * 0.0
 
         # Vectorized gather of the per-row read positions (replaces the per-row
         # Python loop). With predictor_ks[b]=0 the read is rlen-1 (last real
@@ -445,6 +474,48 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         inv[order.to(out_sorted.device)] = torch.arange(N, device=out_sorted.device)
         return out_sorted[inv]
 
+    def _embed_sharded_no_grad(
+        self,
+        ids: torch.Tensor,
+        mask: torch.Tensor,
+        lengths: torch.Tensor,
+        micro_bs: int,
+        predictor_k: "int | list[int]" = 0,
+        predictor_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Data-parallel wrapper around _embed_chunked_no_grad.
+
+        The TCR-shaping RPCs are ONE_TO_ALL, so without this every rank redundantly
+        embeds the FULL batch and only rank 0's copy is kept. Here each rank embeds
+        a contiguous 1/world_size row shard and the (small, N x d fp32) results are
+        all-gathered, so wall-clock scales ~1/world_size. Per-row outputs are
+        independent, so the result is bitwise-identical to the unsharded path.
+        """
+        N = ids.shape[0]
+        world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        per_row_k = isinstance(predictor_k, (list, tuple))
+
+        def _run(i_lo: int, i_hi: int) -> torch.Tensor:
+            if i_hi <= i_lo:
+                d = self.actor.engine.module.config.hidden_size
+                return torch.zeros(0, d, dtype=torch.float32)
+            k = list(predictor_k[i_lo:i_hi]) if per_row_k else predictor_k
+            return self._embed_chunked_no_grad(
+                ids[i_lo:i_hi], mask[i_lo:i_hi], lengths[i_lo:i_hi],
+                use_ema=False, micro_bs=micro_bs,
+                predictor_k=k, predictor_token_id=predictor_token_id,
+            ).float().cpu()
+
+        if world == 1:
+            return _run(0, N)
+
+        rank = torch.distributed.get_rank()
+        bounds = [round(N * r / world) for r in range(world + 1)]
+        local = _run(bounds[rank], bounds[rank + 1])
+        gathered: list = [None] * world
+        torch.distributed.all_gather_object(gathered, local)
+        return torch.cat([g for g in gathered], dim=0)
+
     # ------------------------------------------------ TCR reward scoring ---
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def score_cot_embeddings(self, data: TensorDict) -> TensorDict:
@@ -467,9 +538,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         micro_bs = max(1, cfg.embed_micro_batch_size)
         N = data["cot_input_ids"].shape[0]
         with engine.eval_mode():
-            emb = self._embed_chunked_no_grad(
+            emb = self._embed_sharded_no_grad(
                 data["cot_input_ids"], data["cot_attn_mask"], data["cot_lengths"],
-                use_ema=False, micro_bs=micro_bs,
+                micro_bs=micro_bs,
                 predictor_k=[cfg.predictor_k] * N,
                 predictor_token_id=cfg.predictor_token_id,
             )
@@ -489,9 +560,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         assert self.jepa_cfg is not None, "Call jepa_init() before embed_targets()"
         micro_bs = max(1, self.jepa_cfg.embed_micro_batch_size)
         with self.actor.engine.eval_mode():
-            emb = self._embed_chunked_no_grad(
+            emb = self._embed_sharded_no_grad(
                 data["target_input_ids"], data["target_attn_mask"], data["target_lengths"],
-                use_ema=False, micro_bs=micro_bs, predictor_k=0,
+                micro_bs=micro_bs, predictor_k=0,
             )
         aggressive_empty_cache(force_sync=True)
         return TensorDict({"target_emb": emb.float().cpu()}, batch_size=[])
