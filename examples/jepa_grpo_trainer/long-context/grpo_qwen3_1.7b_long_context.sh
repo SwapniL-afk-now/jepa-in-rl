@@ -67,9 +67,10 @@ export WANDB_SILENT=${WANDB_SILENT:-true}
 export WANDB_MODE=${WANDB_MODE:-online}
 
 ########################### user-adjustable ###########################
-# Qwen2.5-Math-1.5B-Instruct: more concise than Qwen3-1.7B, so responses fit the
-# 3072-token budget instead of running to the cap. No thinking-mode template.
-MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
+# Qwen2.5-Math-1.5B-Instruct with YaRN (4096->32768), same model as the JEPA run,
+# so this no-JEPA baseline isolates JEPA's contribution AND shows YaRN's effect on
+# short-context math. More concise than Qwen3-1.7B; responses fit the 3072 budget.
+MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct-yarn32k}
 PYTHON_BIN=${PYTHON_BIN:-/workspace/exploration/.venv/bin/python3}
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN=python3
@@ -329,7 +330,10 @@ ROLLOUT=(
 
 # The trainer shares the JEPA-capable entrypoint, but this recipe hard-disables
 # that branch. No teacher cache is read or required.
-JEPA=(jepa.enable=False)
+# n_cot=8/n_code=0: jepa.enable=False does NOT stop the CoT/code rollout split
+# (that is gated only on n_code>0), and n_code defaults to 4 -> half the rollouts
+# would be Python-code framed and fed to the GRPO gradient. Force pure math CoT.
+JEPA=(jepa.enable=False jepa.n_cot=8 jepa.n_code=0)
 
 REF=(
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True

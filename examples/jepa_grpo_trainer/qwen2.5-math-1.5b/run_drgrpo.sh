@@ -69,7 +69,13 @@ export WANDB_SILENT=${WANDB_SILENT:-true}
 export WANDB_MODE=${WANDB_MODE:-online}
 
 ########################### user-adjustable ###########################
-MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}
+EXPECTED_MODEL_BASENAME=${EXPECTED_MODEL_BASENAME:-Qwen2.5-Math-1.5B-Instruct}
+MODEL_PATH=${MODEL_PATH:-/workspace/models/${EXPECTED_MODEL_BASENAME}}
+ALLOW_MODEL_PATH_OVERRIDE=${ALLOW_MODEL_PATH_OVERRIDE:-false}
+PYTHON_BIN=${PYTHON_BIN:-/workspace/exploration/.venv/bin/python3}
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    PYTHON_BIN=python3
+fi
 TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-2}
@@ -78,6 +84,7 @@ export NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE:-1}
 
 EVAL_DATA_DIR=${EVAL_DATA_DIR:-/workspace/jepa-grpo-cache/eval_data}
 PREPARE_EVAL_DATA=${PREPARE_EVAL_DATA:-true}
+AMC23_ONLY=${AMC23_ONLY:-false}
 # Contamination-free cutoff for LiveCodeBench: only problems released on/after this
 # date are kept. Should match the base model's pretraining cutoff, not the RL
 # dataset's date. DeepSeek-R1-Distill-Qwen is distilled from Qwen2.5, reported with
@@ -111,7 +118,7 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
     mkdir -p "${EVAL_DATA_DIR}"
     for ds in math500 olympiadbench amc23 aime24 aime25 aime26 minervamath; do
         if [[ ! -f "${EVAL_DATA_DIR}/${ds}.parquet" ]]; then
-            python3 -m verl.experimental.fepo.data \
+            "${PYTHON_BIN}" -m verl.experimental.fepo.data \
                 --dataset "math-ai/${ds}" --split test \
                 --output "${EVAL_DATA_DIR}/${ds}.parquet"
         fi
@@ -120,15 +127,20 @@ if [[ "${PREPARE_EVAL_DATA}" == "true" ]]; then
     # restricted to its stdin/stdout-test subset and filtered to LCB_CUTOFF_DATE.
     for cb in humanevalplus mbppplus; do
         if [[ ! -f "${EVAL_DATA_DIR}/${cb}.parquet" ]]; then
-            python3 -m verl.experimental.fepo.code_data \
+            "${PYTHON_BIN}" -m verl.experimental.fepo.code_data \
                 --benchmark "${cb}" --output "${EVAL_DATA_DIR}/${cb}.parquet"
         fi
     done
     if [[ ! -f "${EVAL_DATA_DIR}/livecodebench.parquet" ]]; then
-        python3 -m verl.experimental.fepo.code_data \
+        "${PYTHON_BIN}" -m verl.experimental.fepo.code_data \
             --benchmark livecodebench --cutoff-date "${LCB_CUTOFF_DATE}" \
             --output "${EVAL_DATA_DIR}/livecodebench.parquet"
     fi
+fi
+
+if [[ "${AMC23_ONLY}" == "true" ]]; then
+    VAL_FILES="[${EVAL_DATA_DIR}/amc23.parquet]"
+    BEST_CKPT_SOURCES='["amc23"]'
 fi
 
 # DAPO uses data.train_batch_size as prompts per optimizer step.
@@ -223,6 +235,7 @@ ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}   # vLLM KV-cache fraction; 0.
 # ROLLOUT_N matches NUM_GENERATIONS for consistency
 ROLLOUT_N=${ROLLOUT_N:-${NUM_GENERATIONS}}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
+VLLM_KV_CACHE_DTYPE=${VLLM_KV_CACHE_DTYPE:-auto}
 ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}   # more parallel sequences during vLLM rollout
 VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-8}    # halved vs. 1.5B to bound val-time rollout memory
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-128}
@@ -236,20 +249,39 @@ MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-800}   # fixed-length run on dapo-mat
 SAVE_FREQ=${SAVE_FREQ:-10}
 TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}   # skip the step-0 pre-train validation; go straight into training
+EVAL_ONLY=${EVAL_ONLY:-false}
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
 
-PROJECT_NAME=${PROJECT_NAME:-dapo_deepseek_1.5B}
+PROJECT_NAME=${PROJECT_NAME:-grpo-qwen-1.5b}
 export WANDB_ENTITY=${WANDB_ENTITY:-ismamnurswapnil-bangladesh-university-of-engineering-and}
+export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
-MODEL_NAME=${MODEL_NAME:-$(basename "${MODEL_PATH}")}
+MODEL_NAME_FROM_PATH=$(basename "${MODEL_PATH}")
+MODEL_NAME=${MODEL_NAME_OVERRIDE:-${MODEL_NAME_FROM_PATH}}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
 ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-null}
 VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-null}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-drgrpo-${MODEL_NAME}-${RUN_TIMESTAMP}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-drgrpo-${MODEL_NAME//\//-}-${RUN_TIMESTAMP}}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 ########################### end user-adjustable ###########################
+
+if [[ "$(basename "${MODEL_PATH}")" != "${EXPECTED_MODEL_BASENAME}" && "${ALLOW_MODEL_PATH_OVERRIDE}" != "true" ]]; then
+    echo "Refusing to run qwen2.5-math-1.5b recipe with MODEL_PATH=${MODEL_PATH}" >&2
+    echo "Expected basename: ${EXPECTED_MODEL_BASENAME}" >&2
+    echo "Set ALLOW_MODEL_PATH_OVERRIDE=true only if this mismatch is intentional." >&2
+    exit 1
+fi
+
+if [[ ! -d "${MODEL_PATH}" ]]; then
+    echo "Missing model directory: ${MODEL_PATH}" >&2
+    exit 1
+fi
+
+if [[ "${EVAL_ONLY}" == "true" ]]; then
+    VAL_BEFORE_TRAIN=true
+fi
 
 if (( N_COT + N_CODE != ROLLOUT_N )); then
     echo "N_COT (${N_COT}) + N_CODE (${N_CODE}) must equal ROLLOUT_N (${ROLLOUT_N})" >&2
@@ -405,6 +437,7 @@ TRAINER=(
     trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}
     trainer.validation_data_dir=${VALIDATION_DATA_DIR}
     trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP}
+    +trainer.val_only=${EVAL_ONLY}
     +trainer.best_ckpt_sources=${BEST_CKPT_SOURCES}
     +trainer.best_ckpt_metrics=${BEST_CKPT_METRICS}
     +trainer.validation_seeds=${VALIDATION_SEEDS}
@@ -421,12 +454,12 @@ EXTRA=(
     actor_rollout_ref.model.use_fused_kernels=True
     actor_rollout_ref.model.fused_kernel_options.impl_backend=triton
     actor_rollout_ref.rollout.max_num_batched_tokens=16384
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=${VLLM_KV_CACHE_DTYPE}
     +actor_rollout_ref.actor.fuse_old_log_prob=True
 )
 
 ########################### launch ###########################
-VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND} python3 -m verl.experimental.jepa_grpo.main_ray \
+VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND} "${PYTHON_BIN}" -m verl.experimental.jepa_grpo.main_ray \
     --config-name jepa_grpo_ray_qwen25_1_5b \
     "${DATA[@]}" \
     "${MODEL[@]}" \

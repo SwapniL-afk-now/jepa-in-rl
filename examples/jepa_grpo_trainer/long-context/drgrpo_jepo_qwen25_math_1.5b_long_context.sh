@@ -83,10 +83,9 @@ PYTHON_BIN=${PYTHON_BIN:-/workspace/exploration/.venv/bin/python3}
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN=python3
 fi
-# Easy OpenR1 long-trace subset (same data the Dr.GRPO baseline trains on). Its
-# own teacher_targets.responses.pt supplies the long CoT teacher view below.
-OPENR1_LONG_TRACE_DIR=${OPENR1_LONG_TRACE_DIR:-/workspace/jepa-grpo-cache/data/openr1_math_17k_long_traces_easy}
-TRAIN_FILE=${TRAIN_FILE:-${OPENR1_LONG_TRACE_DIR}/train.parquet}
+# Dataset matched to the qwen2.5-math-1.5b/run_drgrpo_jepa.sh recipe (DAPO math 17k),
+# rather than the long-trace OpenR1 subset.
+TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-2}
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
@@ -163,8 +162,8 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}   # short non-thinking student rollout budget; shared by train + eval
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}   # 1.5B model: smaller activations allow a larger per-GPU token budget than the 3B's 16384
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}   # student rollout generation budget; shared by train + eval
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-49152}   # 2x: pack more tokens per PPO-update micro-batch to raise low actor-update GPU util (~19GB headroom at 24576)
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
 DAPO_USE_LORA=${DAPO_USE_LORA:-true}   # false -> full fine-tuning; set true to re-enable LoRA
 LORA_RANK=${LORA_RANK:-512}
@@ -192,22 +191,37 @@ ALPHA=${ALPHA:-0.03}
 EMA_DECAY=${EMA_DECAY:-0.99}
 # One full teacher trajectory is encoded per no-grad micro-batch.  This avoids
 # padding multiple 32k+ trajectories to one width and keeps target memory bounded.
-EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-1}
+# cc-jepa uses jepa_anchor_set=all (512 anchor rows/step vs ~150 correct-only).
+# jepa_update measured at 111s/192s step (58%), GPU compute-bound at 99-100%
+# even at micro_bs=16 with ~57GB still idle (40/98GB used) — pushing further to
+# see if idle memory converts to throughput; watch for OOM (rows pad to batch
+# max, so a few near-32k rows in one micro-batch can spike memory nonlinearly).
+EMBED_MICRO_BATCH_SIZE=${EMBED_MICRO_BATCH_SIZE:-16}   # 32 measured slower (compute-bound, more mem pressure); 16 was the fastest observed
 # Qwen2.5-Math YaRN variant supports 32,768 positions. Targets are truncated to
 # this so no [x, y^+] exceeds the extended context (beyond which YaRN positions
 # are again out-of-distribution). Covers the 1,024-token prompt + the ~22k-token
 # max teacher trace with headroom; median trace is ~7k.
 TARGET_MAX_LENGTH=${TARGET_MAX_LENGTH:-32768}
 MIN_VALID_PAIRS=${MIN_VALID_PAIRS:-2}
-# CoT-only objective for long-context: align_cot + SIGReg(pred_cot), no code arm,
-# no self-consistency. Requires only the CoT teacher cache (no code cache).
-JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-jepa-tcr-cot}
-JEPA_REWARD_BETA=${JEPA_REWARD_BETA:-0.5}
+# CC-JEPA (CoT-only): L = (1-lambda)*L_CC-align + lambda*L_SIGReg, where
+# L_CC-align is a single Bernoulli likelihood over the JEPA distance
+# d = 1 - cos(pred, z^+): correct rollouts pull toward the teacher target,
+# incorrect rollouts act as negative views pushed away (replaces the old
+# correct-only stratified align_cot term). SIGReg (anti-collapse) is
+# unchanged in kind, now applied over the full correct+wrong pool since
+# JEPA_ANCHOR_SET=all. No self/code arms, no stratified weighting on the
+# align side. All-correct groups reduce L_CC-align exactly to ordinary
+# cosine LLM-JEPA / tau. (Old objective: JEPA_LOSS_TYPE=jepa-tcr-cot,
+# align_cot(correct-only) + TRIPLET_SIGREG_LAMBDA * SIGReg.)
+JEPA_LOSS_TYPE=${JEPA_LOSS_TYPE:-cc-jepa}
+CC_TAU=${CC_TAU:-0.5}   # latent correctness scale: P(correct|d) = exp(-d/tau)
+# 0 = isolate the differentiable JEPA loss (align_cot + SIGReg); no reward-shaping
+# advantage term, so any effect is attributable to representation alignment alone.
+JEPA_REWARD_BETA=${JEPA_REWARD_BETA:-0.0}
 JEPA_SIGMA_FLOOR=${JEPA_SIGMA_FLOOR:-0.1}
-# Teacher CoT view = the dataset's OWN verified-correct long R1 traces, built
-# alongside train.parquet by build_openr1_long_trace_subset.py. No separate cache.
-TEACHER_CACHE=${TEACHER_CACHE:-${OPENR1_LONG_TRACE_DIR}/teacher_targets.responses.pt}
-# CoT-only mode uses NO code teacher cache (do not inherit TEACHER_CACHE).
+# Teacher CoT view matched to the qwen2.5-math-1.5b/run_drgrpo_jepa.sh recipe.
+TEACHER_CACHE=${TEACHER_CACHE:-/workspace/jepa-grpo-cache/teacher_targets.pt.responses.pt}
+# CoT-only mode: no code teacher cache.
 CODE_TEACHER_CACHE=${CODE_TEACHER_CACHE:-}
 CODE_SYSTEM_PROMPT=${CODE_SYSTEM_PROMPT:-}
 TCR_MATCH=${TCR_MATCH:-cycle}
@@ -217,12 +231,16 @@ AUTO_OFF_PATIENCE=${AUTO_OFF_PATIENCE:-10}
 AUTO_OFF_MIN_DELTA=${AUTO_OFF_MIN_DELTA:-0.002}
 AUTO_OFF_WARMUP=${AUTO_OFF_WARMUP:-20}
 AUTO_OFF_MIN_COS=${AUTO_OFF_MIN_COS:-0.0}
-JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-correct}
+# cc-jepa needs ALL rollouts: correct = positives, wrong = negative views.
+JEPA_ANCHOR_SET=${JEPA_ANCHOR_SET:-all}
 LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
-TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.3}
-N_PROJECTIONS=${N_PROJECTIONS:-4096}
+TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.3}   # cc-jepa: L=(1-λ)*CC-align + λ*SIGReg(pool)
+# Match the student's hidden_size (1536 for Qwen2.5-Math-1.5B): enough random
+# directions to span the actual embedding space without paying for 4096's
+# ~2.7x oversampling; SIGReg cost scales with M. (was 4096)
+N_PROJECTIONS=${N_PROJECTIONS:-1536}
 JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
-ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-20}
+ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}   # 0 = full alpha from step 1, no linear ramp
 
 # DAPO overlong reward shaping (soft length penalty applied by the `dapo` reward manager).
 # Canonical DAPO uses a buffer of ~20% of max_response_length (official recipe: 4096/20480),
@@ -274,6 +292,9 @@ VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}   # skip the step-0 pre-train valida
 EVAL_ONLY=${EVAL_ONLY:-false}
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
 
+# verl's wandb logger uses trainer.project_name (=PROJECT_NAME) as the wandb
+# project; the WANDB_PROJECT env var is IGNORED. So set PROJECT_NAME itself to
+# the desired wandb project. Runs are distinguished by EXPERIMENT_NAME below.
 PROJECT_NAME=${PROJECT_NAME:-grpo-qwen-1.5b}
 export WANDB_ENTITY=${WANDB_ENTITY:-ismamnurswapnil-bangladesh-university-of-engineering-and}
 export WANDB_PROJECT=${WANDB_PROJECT:-${PROJECT_NAME}}
@@ -285,12 +306,12 @@ TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-${MAX_OPTIMIZER_STEPS}}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
 ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-null}
 VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-null}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-drgrpo_jepa-${MODEL_NAME//\//-}-${RUN_TIMESTAMP}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-drgrpo-jepa-cot-contrastive-${MODEL_NAME//\//-}-${RUN_TIMESTAMP}}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 ########################### end user-adjustable ###########################
 
 if [[ "$(basename "${MODEL_PATH}")" != "${EXPECTED_MODEL_BASENAME}" && "${ALLOW_MODEL_PATH_OVERRIDE}" != "true" ]]; then
-    echo "Refusing to run qwen3-1.7b recipe with MODEL_PATH=${MODEL_PATH}" >&2
+    echo "Refusing to run this recipe with MODEL_PATH=${MODEL_PATH}" >&2
     echo "Expected basename: ${EXPECTED_MODEL_BASENAME}" >&2
     echo "Set ALLOW_MODEL_PATH_OVERRIDE=true only if this mismatch is intentional." >&2
     exit 1
@@ -311,7 +332,7 @@ if (( N_COT + N_CODE != ROLLOUT_N )); then
 fi
 
 if [[ "${JEPA_ENABLE}" == "True" ]]; then
-# CODE_TEACHER_CACHE is empty in CoT-only mode (jepa-tcr-cot); skip empty entries.
+# Skip empty entries (CODE_TEACHER_CACHE may be unset if overridden back to CoT-only).
 for c in "${TEACHER_CACHE}" "${CODE_TEACHER_CACHE}"; do
     [[ -z "${c}" ]] && continue
     if [[ ! -f "${c}" ]]; then
@@ -411,6 +432,7 @@ JEPA=(
     jepa.target_max_length=${TARGET_MAX_LENGTH}
     jepa.min_valid_pairs=${MIN_VALID_PAIRS}
     jepa.loss_type=${JEPA_LOSS_TYPE}
+    jepa.cc_tau=${CC_TAU}
     jepa.predictor_k=${LLM_JEPA_PREDICTOR_K}
     jepa.triplet_sigreg_lambda=${TRIPLET_SIGREG_LAMBDA}
     jepa.n_projections=${N_PROJECTIONS}

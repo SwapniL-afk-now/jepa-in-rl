@@ -418,7 +418,7 @@ EXTRA=(
     actor_rollout_ref.model.use_fused_kernels=True
     actor_rollout_ref.model.fused_kernel_options.impl_backend=triton
     actor_rollout_ref.rollout.max_num_batched_tokens=16384
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=auto
     +actor_rollout_ref.actor.fuse_old_log_prob=True
 )
 

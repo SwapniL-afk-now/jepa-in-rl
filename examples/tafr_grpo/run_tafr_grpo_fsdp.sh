@@ -140,6 +140,12 @@ LORA_ALPHA=${LORA_ALPHA:-1024}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-all-linear}
 
 ACTOR_LR=${ACTOR_LR:-5e-7}
+# Skip the separate old_log_prob forward when the step is a single on-policy
+# optimizer update (ppo_epochs=1 and PPO_MINI_BATCH_SIZE >= TRAIN_BATCH_SIZE):
+# old == new so the PPO ratio is exactly 1. Auto-falls back to the extra
+# forward whenever that precondition doesn't hold. Saves one full forward
+# pass over all rollout tokens per step.
+FUSE_OLD_LOG_PROB=${FUSE_OLD_LOG_PROB:-true}
 ENTROPY_COEFF=${ENTROPY_COEFF:-0}
 PPO_LOSS_COEF=${PPO_LOSS_COEF:-1}
 CLIP_RATIO=${CLIP_RATIO:-0.2}
@@ -223,6 +229,7 @@ ACTOR=(
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    +actor_rollout_ref.actor.fuse_old_log_prob=${FUSE_OLD_LOG_PROB}
 )
 
 ROLLOUT=(

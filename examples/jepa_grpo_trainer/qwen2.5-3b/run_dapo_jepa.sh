@@ -182,7 +182,7 @@ LLM_JEPA_PREDICTOR_K=${LLM_JEPA_PREDICTOR_K:-1}
 TRIPLET_SIGREG_LAMBDA=${TRIPLET_SIGREG_LAMBDA:-0.3}
 N_PROJECTIONS=${N_PROJECTIONS:-4096}
 JEPA_MAX_GRAD_NORM=${JEPA_MAX_GRAD_NORM:-0.5}
-ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}
+ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-20}
 
 # DAPO overlong reward shaping (soft length penalty applied by the `dapo` reward manager).
 # Canonical DAPO uses a buffer of ~20% of max_response_length (official recipe: 4096/20480),

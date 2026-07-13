@@ -44,6 +44,8 @@ The teacher model is only loaded here; it is NOT loaded during training.
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -85,14 +87,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-samples", type=int, default=8, help="Teacher samples generated per question")
     p.add_argument("--n-targets", type=int, default=4, help="Max correct targets kept per question")
     p.add_argument("--max-rows", type=int, default=-1, help="Cap on questions processed (-1 = all)")
+    p.add_argument("--shard-index", type=int, default=0, help="Zero-based contiguous data shard to process")
+    p.add_argument("--num-shards", type=int, default=1, help="Number of contiguous data shards")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--top-k", type=int, default=-1, help="vLLM top-k; -1 disables it")
     p.add_argument("--max-new-tokens", type=int, default=3072)
     p.add_argument("--tp-size", type=int, default=1, help="vLLM tensor-parallel size for the teacher")
     p.add_argument("--gpu-mem-frac", type=float, default=0.85)
     p.add_argument("--encode-batch-size", type=int, default=16)
     p.add_argument("--gen-batch-prompts", type=int, default=64, help="Prompts per vLLM generate() call")
     p.add_argument("--save-responses", default="", help="Optional .pt path to also save {index: [correct_texts]}")
+    p.add_argument(
+        "--enable-thinking", action=argparse.BooleanOptionalAction, default=False,
+        help="Explicitly enable Qwen3's thinking template; retain its complete <think> trace and final answer.",
+    )
     return p.parse_args()
 
 
@@ -142,6 +151,15 @@ def main() -> None:
     df = pd.read_parquet(args.train_file)
     if args.max_rows > 0:
         df = df.iloc[: args.max_rows]
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index must be in [0, --num-shards)")
+    if args.num_shards > 1:
+        # Contiguous, non-overlapping partitions: each independent TP=1 vLLM
+        # process can own one GPU, and their text dicts can be merged by key.
+        start = len(df) * args.shard_index // args.num_shards
+        end = len(df) * (args.shard_index + 1) // args.num_shards
+        df = df.iloc[start:end]
+        print(f"[precompute] shard {args.shard_index + 1}/{args.num_shards}: rows {start}:{end}", flush=True)
 
     # System prompt prepended to every question. For --view code this is the code
     # framing (mirrors JEPARayConfig.code_system_prompt) so the generator emits
@@ -163,6 +181,7 @@ def main() -> None:
         n=args.n_samples,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
         max_tokens=args.max_new_tokens,
     )
 
@@ -172,7 +191,12 @@ def main() -> None:
     # system prompt so the coder model emits an executable Python program.
     prompt_texts = [
         teacher_tok.apply_chat_template(
-            _row_messages(r["prompt"], system_prompt), tokenize=False, add_generation_prompt=True
+            _row_messages(r["prompt"], system_prompt),
+            tokenize=False,
+            add_generation_prompt=True,
+            # Qwen3's hard switch is applied during prompt rendering. Do not
+            # pass it for other teachers whose chat template may not accept it.
+            **({"enable_thinking": True} if args.enable_thinking else {}),
         )
         for r in rows
     ]
@@ -212,7 +236,12 @@ def main() -> None:
     # ---- Phase 1c: save the verified-correct TEXT cache (no encoding) ----
     # Corrected TCR-JEPA stores only y^+ text; z^+ is recomputed online by the policy.
     cache_text: dict[int, list[str]] = {idx: responses for idx, _prompt, responses in kept}
-    torch.save(cache_text, args.out)
+    # Publish atomically so concurrent shard-merging jobs never observe a
+    # partially-written cache.
+    out_path = Path(args.out)
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    torch.save(cache_text, tmp_path)
+    os.replace(tmp_path, out_path)
     print(f"[precompute] wrote verified-correct text targets for {len(cache_text)} questions -> {args.out}")
 
     # Optional duplicate copy under the legacy .responses.pt name, if requested.

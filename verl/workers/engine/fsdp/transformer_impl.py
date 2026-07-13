@@ -82,6 +82,25 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _next_token_log_probs_from_output(outputs, input_ids: torch.Tensor) -> torch.Tensor:
+    """Per-token next-token log-probs, shape (B, T-1): lp[:, t] = log p(ids[t+1] | ids[..t]).
+
+    Handles both plain HF outputs (logits) and the fused-kernels
+    CausalLMOutputForPPO (use_fused_kernels=True patches the model class forward
+    to return log_probs computed against roll(input_ids, -1); its last position
+    wraps around to predict ids[0] and is dropped here).
+    """
+    log_probs = getattr(outputs, "log_probs", None)
+    if log_probs is not None:
+        return log_probs[:, :-1]
+    logits = outputs.logits[:, :-1, :].contiguous()
+    labels = input_ids[:, 1:].contiguous()
+    flat_lp = logprobs_from_logits(
+        logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
+    )
+    return flat_lp.view(labels.shape)
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -778,7 +797,11 @@ class FSDPEngine(BaseEngine):
             [p for p in self._tafr_failure.parameters() if p.requires_grad], lr=lr
         )
         target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(device=next(self.module.parameters()).device, dtype=target_dtype)
+        # Keep the failure model on CPU between SFT intervals: it is only used
+        # inside tafr_failure_sft_update (which moves it to GPU and back), and
+        # holding a full base+LoRA clone on GPU every step steals memory from
+        # the actor forwards/backward on the colocated card.
+        self._tafr_failure.to(device="cpu", dtype=target_dtype)
         self._tafr_tokenizer = None
         self._tafr_initialized = True
         if torch.cuda.is_available():
@@ -804,13 +827,8 @@ class FSDPEngine(BaseEngine):
             for start in range(0, input_ids.shape[0], micro_bsz):
                 ids = input_ids[start : start + micro_bsz]
                 mask = attention_mask[start : start + micro_bsz]
-                outputs = module(input_ids=ids, attention_mask=mask, use_cache=False)
-                logits = outputs.logits[:, :-1, :].contiguous()
-                labels = ids[:, 1:].contiguous()
-                flat_lp = logprobs_from_logits(
-                    logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
-                )
-                lp = flat_lp.view(labels.shape)[:, -response_len:]
+                outputs = module(input_ids=ids, attention_mask=mask, use_cache=False, return_dict=True)
+                lp = _next_token_log_probs_from_output(outputs, ids)[:, -response_len:]
                 all_lp.append(lp)
         module.train(module_was_training)
         return torch.cat(all_lp, dim=0).detach()
@@ -899,7 +917,7 @@ class FSDPEngine(BaseEngine):
         total_loss = 0.0
         device = next(self.module.parameters()).device
         target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(dtype=target_dtype)
+        self._tafr_failure.to(device=device, dtype=target_dtype)
         self._tafr_move_optimizer_state(self._tafr_failure_optimizer, device)
         max_seq_len = int(tafr_config.get("max_response_length", 2048))
         # Gradient checkpointing: recompute activations during backward instead
@@ -951,11 +969,8 @@ class FSDPEngine(BaseEngine):
             enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
             prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
             prompt_lens = prompt_enc["attention_mask"].sum(dim=-1)
-            outputs = self._tafr_failure(**enc, use_cache=False)
-            logits = outputs.logits[:, :-1, :].contiguous()
-            labels = enc["input_ids"][:, 1:].contiguous()
-            flat_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False)
-            log_probs = flat_lp.view(labels.shape)
+            outputs = self._tafr_failure(**enc, use_cache=False, return_dict=True)
+            log_probs = _next_token_log_probs_from_output(outputs, enc["input_ids"])
             token_positions = torch.arange(log_probs.shape[-1], device=device).unsqueeze(0)
             response_mask = (token_positions >= (prompt_lens - 1).unsqueeze(1)) & enc["attention_mask"][:, 1:].bool()
             denom = response_mask.sum(dim=-1).clamp_min(1).float()
@@ -966,6 +981,9 @@ class FSDPEngine(BaseEngine):
             total_loss += float(loss.detach().cpu())
             updates += 1
         self._tafr_failure.gradient_checkpointing_disable()
+        # Offload model + optimizer back to CPU until the next SFT interval so
+        # the GPU memory is available for the actor update.
+        self._tafr_failure.to(device="cpu")
         self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1023,12 +1041,15 @@ class FSDPEngine(BaseEngine):
                         self._tafr_fail_lora_ema_state[key] = gamma * self._tafr_fail_lora_ema_state[key] + (1.0 - gamma) * value
                     else:
                         self._tafr_fail_lora_ema_state[key] = value.clone()
-        anchor_state = self._tafr_mix_states(self._tafr_grpo_ema_state, eta)
-        replay_state = self._tafr_mix_states(self._tafr_fail_ema_state, eta)
         if self._tafr_uses_vllm_logprobs(tafr_config):
+            # vLLM scores anchor/replay via the exported LoRA adapters; the
+            # full-model mixed clones are never used there, so skip building
+            # them (two full-model CPU mixes + GPU clones per refresh).
             self._tafr_anchor = None
             self._tafr_replay = None
         else:
+            anchor_state = self._tafr_mix_states(self._tafr_grpo_ema_state, eta)
+            replay_state = self._tafr_mix_states(self._tafr_fail_ema_state, eta)
             self._tafr_anchor = self._tafr_clone_from_state(anchor_state, trainable=False)
             self._tafr_replay = self._tafr_clone_from_state(replay_state, trainable=False)
         if self.rank == 0:
@@ -1649,362 +1670,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output["sum_pi_squared"] = sum_pi_squared
 
         return model_output
-
-    def _tafr_actor_state_cpu(self) -> dict[str, torch.Tensor]:
-        def _to_full_cpu(v: torch.Tensor) -> torch.Tensor:
-            return v.full_tensor().detach().cpu() if hasattr(v, "full_tensor") else v.detach().cpu().clone()
-
-        if fsdp_version(self.module) == 1 and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
-            with FSDP.summon_full_params(self.module, writeback=False):
-                raw = peft_model.state_dict()
-            return {k: _to_full_cpu(v) for k, v in raw.items() if torch.is_tensor(v)}
-
-        return {k: _to_full_cpu(v) for k, v in self.module.state_dict().items() if torch.is_tensor(v)}
-
-    def _tafr_clone_trainable_module(self):
-        module = self._build_module()
-        if self._is_lora:
-            module = self._build_lora_module(module)
-        # Cast to the FSDP mixed-precision param dtype (typically bf16) so that
-        # FlashAttention (fp16/bf16 only) works on cloned anchor/replay/failure models.
-        target_dtype = getattr(self, '_autocast_dtype', torch.bfloat16)
-        device = next(self.module.parameters()).device
-        module.to(device=device, dtype=target_dtype)
-        return module
-
-    def _tafr_clone_from_state(self, state: dict[str, torch.Tensor], trainable: bool):
-        module = self._tafr_clone_trainable_module()
-        device = next(module.parameters()).device
-        target_dtype = next(module.parameters()).dtype
-        loaded = {
-            k: v.to(device=device, dtype=target_dtype) if torch.is_floating_point(v) else v.to(device)
-            for k, v in state.items()
-        }
-        missing, unexpected = module.load_state_dict(loaded, strict=False)
-        if self.rank == 0 and (missing or unexpected):
-            logger.warning(f"TAFR clone loaded with missing={len(missing)} unexpected={len(unexpected)} keys")
-        module.train(trainable)
-        for param in module.parameters():
-            param.requires_grad_(trainable)
-        return module
-
-    def _tafr_move_optimizer_state(self, optimizer, device):
-        for state in optimizer.state.values():
-            for key, value in state.items():
-                if torch.is_tensor(value):
-                    state[key] = value.to(device=device, non_blocking=True)
-
-    def tafr_init(self, tafr_config: dict):
-        if getattr(self, "_tafr_initialized", False):
-            return {"tafr_initialized": True}
-        if self.engine_config.strategy not in ("fsdp", "fsdp2"):
-            raise NotImplementedError("TAFR-GRPO currently supports only FSDP/FSDP2 HF actors.")
-        ref_state = self._tafr_actor_state_cpu()
-        self._tafr_ref_state = {k: v.clone() for k, v in ref_state.items()}
-        self._tafr_grpo_ema_state = {k: v.clone() for k, v in ref_state.items()}
-        self._tafr_fail_ema_state = {k: v.clone() for k, v in ref_state.items()}
-        if self._is_lora:
-            ref_lora_state = self._tafr_actor_lora_state_cpu()
-            self._tafr_ref_lora_state = {k: v.clone() for k, v in ref_lora_state.items()}
-            self._tafr_grpo_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
-            self._tafr_fail_lora_ema_state = {k: v.clone() for k, v in ref_lora_state.items()}
-        if self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-            self._tafr_replay = None
-        else:
-            self._tafr_anchor = self._tafr_clone_from_state(ref_state, trainable=False)
-            self._tafr_replay = self._tafr_clone_from_state(ref_state, trainable=False)
-        self._tafr_failure = self._tafr_clone_from_state(ref_state, trainable=True)
-        lr = float(tafr_config.get("failure_sft_lr", 1.0e-6))
-        self._tafr_failure_optimizer = torch.optim.AdamW(
-            [p for p in self._tafr_failure.parameters() if p.requires_grad], lr=lr
-        )
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(device=next(self.module.parameters()).device, dtype=target_dtype)
-        self._tafr_tokenizer = None
-        self._tafr_initialized = True
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {"tafr_initialized": True}
-
-    def _tafr_mix_states(self, ema_state: dict[str, torch.Tensor], eta: float) -> dict[str, torch.Tensor]:
-        mixed = {}
-        for key, ref_value in self._tafr_ref_state.items():
-            ema_value = ema_state.get(key, ref_value)
-            if torch.is_floating_point(ref_value):
-                mixed[key] = (1.0 - eta) * ref_value + eta * ema_value.to(ref_value.dtype)
-            else:
-                mixed[key] = ema_value.clone()
-        return mixed
-
-    def _tafr_model_log_probs(self, module, input_ids, attention_mask, response_mask, micro_bsz: int = 16):
-        module_was_training = module.training
-        module.eval()
-        response_len = response_mask.shape[-1]
-        all_lp = []
-        with torch.no_grad():
-            for start in range(0, input_ids.shape[0], micro_bsz):
-                ids = input_ids[start : start + micro_bsz]
-                mask = attention_mask[start : start + micro_bsz]
-                outputs = module(input_ids=ids, attention_mask=mask, use_cache=False)
-                logits = outputs.logits[:, :-1, :].contiguous()
-                labels = ids[:, 1:].contiguous()
-                flat_lp = logprobs_from_logits(
-                    logits=logits.view(-1, logits.size(-1)), labels=labels.view(-1), inplace_backward=False
-                )
-                lp = flat_lp.view(labels.shape)[:, -response_len:]
-                all_lp.append(lp)
-        module.train(module_was_training)
-        return torch.cat(all_lp, dim=0).detach()
-
-    def tafr_compute_anchor_log_prob(self, data: TensorDict) -> TensorDict:
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_anchor is None:
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
-        return TensorDict({"tafr_anchor_log_probs": anchor_lp}, batch_size=[anchor_lp.shape[0]])
-
-    def _tafr_get_tokenizer(self):
-        if self._tafr_tokenizer is None:
-            from transformers import AutoTokenizer
-
-            self._tafr_tokenizer = AutoTokenizer.from_pretrained(
-                self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code
-            )
-            if self._tafr_tokenizer.pad_token_id is None:
-                self._tafr_tokenizer.pad_token = self._tafr_tokenizer.eos_token
-        return self._tafr_tokenizer
-
-    def tafr_compute_replay_log_prob(self, data: TensorDict) -> TensorDict:
-        """Evaluate frozen pi_replay on the actor-generated (pi_old) rollout samples.
-
-        No generation happens here. Responses were already sampled by pi_old during
-        rollout. We just score them under pi_replay so the actor loss can compute:
-            - beta * (1 - r_bar_x) * D_KL(pi_replay || pi_theta)
-        using the same y_i samples used for GRPO and anchor KL.
-        """
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_replay is None:
-            self._tafr_replay = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
-        return TensorDict({"tafr_replay_log_probs": replay_lp}, batch_size=[replay_lp.shape[0]])
-
-    def tafr_compute_anchor_and_replay_log_probs(self, data: TensorDict) -> TensorDict:
-        tafr_config = tu.get_non_tensor_data(data=data, key="custom_tafr_grpo", default={}) or {}
-        self.tafr_init(tafr_config)
-        if self._tafr_anchor is None:
-            self._tafr_anchor = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_grpo_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        if self._tafr_replay is None:
-            self._tafr_replay = self._tafr_clone_from_state(
-                self._tafr_mix_states(self._tafr_fail_ema_state, float(tafr_config.get("mix_eta", 1.0))),
-                trainable=False,
-            )
-        padded = data.to_padded_tensor()
-        input_ids = padded["input_ids"].to(next(self.module.parameters()).device)
-        attention_mask = padded["attention_mask"].to(input_ids.device)
-        response_mask = padded["response_mask"].to(input_ids.device)
-        anchor_lp = self._tafr_model_log_probs(self._tafr_anchor, input_ids, attention_mask, response_mask)
-        replay_lp = self._tafr_model_log_probs(self._tafr_replay, input_ids, attention_mask, response_mask)
-        return TensorDict(
-            {"tafr_anchor_log_probs": anchor_lp, "tafr_replay_log_probs": replay_lp},
-            batch_size=[anchor_lp.shape[0]],
-        )
-
-    def tafr_failure_sft_update(self, records: list[dict], tafr_config: dict):
-        self.tafr_init(tafr_config)
-        if not records:
-            return {"tafr_grpo/failure_sft_updates": 0.0}
-        tokenizer = self._tafr_get_tokenizer()
-        batch_size = int(tafr_config.get("failure_sft_batch_size", 1))
-        # max_updates caps optimizer steps; defaults to processing all records.
-        max_updates = int(tafr_config.get("failure_sft_max_updates_per_interval", len(records)))
-        updates = 0
-        total_loss = 0.0
-        device = next(self.module.parameters()).device
-        target_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        self._tafr_failure.to(dtype=target_dtype)
-        self._tafr_move_optimizer_state(self._tafr_failure_optimizer, device)
-        max_seq_len = int(tafr_config.get("max_response_length", 2048))
-        # Gradient checkpointing: recompute activations during backward instead
-        # of storing them. vLLM stays resident on the same GPU (NCCL_CUMEM_ENABLE=0
-        # prevents cumem-based sleep from freeing weights), so activations must be
-        # minimised to avoid OOM.
-        self._tafr_failure.gradient_checkpointing_enable()
-        self._tafr_failure.train()
-        torch.cuda.empty_cache()
-        # Build micro-batches. When failure_sft_max_token_len_per_gpu > 0, pack records
-        # greedily by a padded-token budget (n_rows * max_len_in_batch) so each step
-        # fills the GPU rather than using a fixed row count; otherwise fall back to the
-        # fixed failure_sft_batch_size grouping. Either way cap at max_updates steps.
-        max_token_len = int(tafr_config.get("failure_sft_max_token_len_per_gpu", 0))
-        if max_token_len > 0:
-            lengths = [
-                len(
-                    tokenizer(
-                        str(r["prompt"]) + str(r["wrong_response"]),
-                        truncation=True,
-                        max_length=max_seq_len,
-                    )["input_ids"]
-                )
-                for r in records
-            ]
-            order = sorted(range(len(records)), key=lambda i: lengths[i])
-            micro_batches: list[list[dict]] = []
-            cur: list[int] = []
-            cur_max = 0
-            for i in order:
-                new_max = max(cur_max, lengths[i])
-                if cur and (len(cur) + 1) * new_max > max_token_len:
-                    micro_batches.append([records[j] for j in cur])
-                    cur, cur_max = [i], lengths[i]
-                else:
-                    cur.append(i)
-                    cur_max = new_max
-            if cur:
-                micro_batches.append([records[j] for j in cur])
-            micro_batches = micro_batches[:max_updates]
-        else:
-            micro_batches = [
-                records[start : start + batch_size]
-                for start in range(0, min(len(records), batch_size * max_updates), batch_size)
-            ]
-        for chunk in micro_batches:
-            texts = [str(r["prompt"]) + str(r["wrong_response"]) for r in chunk]
-            prompts = [str(r["prompt"]) for r in chunk]
-            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
-            prompt_enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_seq_len).to(device)
-            prompt_lens = prompt_enc["attention_mask"].sum(dim=-1)
-            outputs = self._tafr_failure(**enc, use_cache=False)
-            logits = outputs.logits[:, :-1, :].contiguous()
-            labels = enc["input_ids"][:, 1:].contiguous()
-            flat_lp = logprobs_from_logits(logits.view(-1, logits.size(-1)), labels.view(-1), inplace_backward=False)
-            log_probs = flat_lp.view(labels.shape)
-            token_positions = torch.arange(log_probs.shape[-1], device=device).unsqueeze(0)
-            response_mask = (token_positions >= (prompt_lens - 1).unsqueeze(1)) & enc["attention_mask"][:, 1:].bool()
-            denom = response_mask.sum(dim=-1).clamp_min(1).float()
-            loss = -((log_probs * response_mask).sum(dim=-1) / denom).mean()
-            self._tafr_failure_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self._tafr_failure_optimizer.step()
-            total_loss += float(loss.detach().cpu())
-            updates += 1
-        self._tafr_failure.gradient_checkpointing_disable()
-        self._tafr_move_optimizer_state(self._tafr_failure_optimizer, torch.device("cpu"))
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {
-            "tafr_grpo/failure_sft_updates": float(updates),
-            "tafr_grpo/failure_sft_loss": total_loss / max(updates, 1),
-        }
-
-    def tafr_save_and_refresh(self, local_path: str, global_step: int, failure_model_changed: bool, tafr_config: dict):
-        self.tafr_init(tafr_config)
-        os.makedirs(local_path, exist_ok=True)
-        # Throttle heavy disk writes: the EMA refresh + vLLM adapter export below always
-        # run (the algorithm needs fresh anchor/replay every refresh), but the failure
-        # model / optimizer / tafr_state.pt are only written when due. Old global_step
-        # dirs are rotated away by the trainer, so the last save replaces the previous.
-        save_interval = int(tafr_config.get("save_to_disk_interval_grpo_steps", 0))
-        save_to_disk = save_interval <= 0 or (global_step % save_interval == 0)
-        save_optimizer = bool(tafr_config.get("save_failure_sft_optimizer", True))
-        failure_dir = os.path.join(local_path, "failure_sft")
-        if save_to_disk and self.rank == 0:
-            os.makedirs(failure_dir, exist_ok=True)
-            torch.save(self._tafr_failure.state_dict(), os.path.join(failure_dir, "pytorch_model.bin"))
-            if save_optimizer:
-                torch.save(self._tafr_failure_optimizer.state_dict(), os.path.join(failure_dir, "optimizer.pt"))
-        gamma = float(tafr_config.get("ema_gamma", 0.9))
-        eta = float(tafr_config.get("mix_eta", 1.0))
-        actor_state = self._tafr_actor_state_cpu()
-        for key, value in actor_state.items():
-            if torch.is_floating_point(value):
-                self._tafr_grpo_ema_state[key] = gamma * self._tafr_grpo_ema_state[key] + (1.0 - gamma) * value
-            else:
-                self._tafr_grpo_ema_state[key] = value.clone()
-        if self._is_lora:
-            actor_lora_state = self._tafr_actor_lora_state_cpu()
-            for key, value in actor_lora_state.items():
-                if torch.is_floating_point(value):
-                    self._tafr_grpo_lora_ema_state[key] = gamma * self._tafr_grpo_lora_ema_state[key] + (1.0 - gamma) * value
-                else:
-                    self._tafr_grpo_lora_ema_state[key] = value.clone()
-        if failure_model_changed:
-            failure_state = {k: v.detach().cpu().clone() for k, v in self._tafr_failure.state_dict().items() if torch.is_tensor(v)}
-            for key, value in failure_state.items():
-                if key not in self._tafr_fail_ema_state:
-                    self._tafr_fail_ema_state[key] = value.clone()
-                elif torch.is_floating_point(value):
-                    self._tafr_fail_ema_state[key] = gamma * self._tafr_fail_ema_state[key] + (1.0 - gamma) * value
-                else:
-                    self._tafr_fail_ema_state[key] = value.clone()
-            if self._is_lora:
-                failure_lora_state = self._tafr_failure_lora_state_cpu()
-                for key, value in failure_lora_state.items():
-                    if key not in self._tafr_fail_lora_ema_state:
-                        self._tafr_fail_lora_ema_state[key] = value.clone()
-                    elif torch.is_floating_point(value):
-                        self._tafr_fail_lora_ema_state[key] = gamma * self._tafr_fail_lora_ema_state[key] + (1.0 - gamma) * value
-                    else:
-                        self._tafr_fail_lora_ema_state[key] = value.clone()
-        anchor_state = self._tafr_mix_states(self._tafr_grpo_ema_state, eta)
-        replay_state = self._tafr_mix_states(self._tafr_fail_ema_state, eta)
-        if self._tafr_uses_vllm_logprobs(tafr_config):
-            self._tafr_anchor = None
-            self._tafr_replay = None
-        else:
-            self._tafr_anchor = self._tafr_clone_from_state(anchor_state, trainable=False)
-            self._tafr_replay = self._tafr_clone_from_state(replay_state, trainable=False)
-        if self.rank == 0:
-            save_dict = {
-                "global_step": global_step,
-                "ema_gamma": gamma,
-                "mix_eta": eta,
-                "failure_model_changed": bool(failure_model_changed),
-                "grpo_ema_state": self._tafr_grpo_ema_state,
-                "fail_ema_state": self._tafr_fail_ema_state,
-            }
-            if self._is_lora:
-                save_dict["grpo_lora_ema_state"] = self._tafr_grpo_lora_ema_state
-                save_dict["fail_lora_ema_state"] = self._tafr_fail_lora_ema_state
-            if save_to_disk:
-                torch.save(save_dict, os.path.join(local_path, "tafr_state.pt"))
-        return {"tafr_refreshed": True, "tafr_failure_ema_updated": bool(failure_model_changed)}
-
-    def tafr_load(self, local_path: str):
-        state_path = os.path.join(local_path, "tafr_state.pt")
-        failure_path = os.path.join(local_path, "failure_sft", "pytorch_model.bin")
-        self.tafr_init({})
-        if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu")
-            self._tafr_grpo_ema_state = state.get("grpo_ema_state", self._tafr_grpo_ema_state)
-            self._tafr_fail_ema_state = state.get("fail_ema_state", self._tafr_fail_ema_state)
-            if self._is_lora:
-                self._tafr_grpo_lora_ema_state = state.get("grpo_lora_ema_state", self._tafr_grpo_lora_ema_state)
-                self._tafr_fail_lora_ema_state = state.get("fail_lora_ema_state", self._tafr_fail_lora_ema_state)
-        if os.path.exists(failure_path):
-            loaded = torch.load(failure_path, map_location="cpu")
-            self._tafr_failure.load_state_dict(loaded, strict=False)
-        return {"tafr_loaded": os.path.exists(state_path)}
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()

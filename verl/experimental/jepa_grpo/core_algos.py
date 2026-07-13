@@ -271,6 +271,88 @@ def _prompt_stratified_align(
     return (per_prompt * any_anchor.to(dtype)).sum() / n_prompts
 
 
+def cc_jepa_loss(
+    pred: torch.Tensor,            # (A, d) student [PRED] reads, L2-normalized
+    teacher_target: torch.Tensor,  # (A, d) online z^+ targets, L2-normalized (sg)
+    is_correct: torch.Tensor,      # (A,) bool — final-answer correctness y_i
+    tau: float = 0.5,              # latent correctness scale
+    lambda_: float = 0.05,         # SIGReg vs CC-align mixing (LeJEPA default)
+    M: int = 1024,
+    n_freq: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    s: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Correctness-Conditioned JEPA (CC-JEPA): L = (1-lambda)*L_CC-align + lambda*L_SIGReg.
+
+    L_CC-align is a single Bernoulli likelihood over the cosine JEPA distance
+    d_i = 1 - <z_i, z_T>, with P(y=1|d) = exp(-d/tau):
+
+        l(y, d) = y * d/tau - (1-y) * log(1 - exp(-d/tau))
+
+    Correct rollouts (y=1) are pulled toward the teacher (dl/dd = 1/tau > 0);
+    incorrect rollouts (y=0) are pushed away (dl/dd < 0), with a repulsion that
+    diverges as d -> 0 (a wrong rollout cannot collapse onto the teacher) and
+    vanishes as d grows (no antipodal over-separation). When every rollout is
+    correct, L_CC-align reduces EXACTLY to ordinary cosine LLM-JEPA scaled by
+    1/tau — no case switching, no margin, no group normalization.
+
+    L_SIGReg is the same anti-collapse regularizer as llm_jepa_tcr_dual_loss
+    (Epps-Pulley test against N(0,I)), computed over the full prediction pool
+    (now correct AND wrong rows, since cc-jepa requires jepa_anchor_set='all').
+    This is the direct replacement of the old align_cot term inside
+    (1-lambda)*align + lambda*SIGReg — only the alignment half changes;
+    anti-collapse pressure is unchanged in kind, just applied over a larger pool.
+    """
+    device, dtype = pred.device, pred.dtype
+    A = pred.shape[0]
+    if A == 0:
+        zero = torch.zeros((), device=device, dtype=dtype)
+        return zero, {
+            "jepa/cc_align_loss": 0.0, "jepa/cc_sigreg_loss": 0.0, "jepa/cc_loss": 0.0,
+            "jepa/llm_jepa_loss": 0.0, "jepa/cc_tau": float(tau), "jepa/cc_lambda": float(lambda_),
+            "jepa/cos_cot": 0.0, "jepa/cos_wrong": 0.0, "jepa/d_correct": 0.0,
+            "jepa/d_wrong": 0.0, "jepa/n_anchors_cot": 0, "jepa/n_wrong": 0, "jepa/pool_size": 0,
+        }
+
+    cos = (pred * teacher_target.detach()).sum(dim=-1)   # (A,)
+    d = 1.0 - cos                                        # in [0, 2]
+    a = (d / tau).clamp_min(torch.finfo(dtype).eps)      # numerical floor only
+    y = is_correct.to(device=device, dtype=dtype)
+
+    positive_nll = a
+    # -log(1 - e^{-a}) computed stably via expm1
+    negative_nll = -torch.log(-torch.expm1(-a))
+    ell = y * positive_nll + (1.0 - y) * negative_nll
+    align = ell.mean()
+
+    sig = sigreg_loss(pred, M=M, n_freq=n_freq, t_min=t_min, t_max=t_max, s=s)
+    loss = (1.0 - lambda_) * align + lambda_ * sig
+
+    corr = is_correct.to(device=device, dtype=torch.bool)
+    n_pos = int(corr.sum().item())
+    n_neg = A - n_pos
+    cos_pos = float(cos[corr].detach().mean().cpu()) if n_pos > 0 else 0.0
+    cos_neg = float(cos[~corr].detach().mean().cpu()) if n_neg > 0 else 0.0
+    return loss, {
+        "jepa/cc_align_loss": float(align.detach().cpu()),
+        "jepa/cc_sigreg_loss": float(sig.detach().cpu()),
+        "jepa/cc_loss": float(loss.detach().cpu()),
+        "jepa/llm_jepa_loss": float(loss.detach().cpu()),  # alias read back by worker
+        "jepa/cc_tau": float(tau),
+        "jepa/cc_lambda": float(lambda_),
+        # "cos_cot" = mean cosine of CORRECT anchors: keeps the auto-off plateau
+        # tracker (default metric jepa/cos_cot, higher = better) working unchanged.
+        "jepa/cos_cot": cos_pos,
+        "jepa/cos_wrong": cos_neg,
+        "jepa/d_correct": float(d[corr].detach().mean().cpu()) if n_pos > 0 else 0.0,
+        "jepa/d_wrong": float(d[~corr].detach().mean().cpu()) if n_neg > 0 else 0.0,
+        "jepa/n_anchors_cot": n_pos,
+        "jepa/n_wrong": n_neg,
+        "jepa/pool_size": A,
+    }
+
+
 def llm_jepa_tcr_dual_loss(
     pred_cot: torch.Tensor,             # (A_c, d) CoT student [PRED] reads, L2-normalized
     teacher_target_cot: torch.Tensor,  # (A_c, d) CoT z^+, recomputed online by current policy (sg)

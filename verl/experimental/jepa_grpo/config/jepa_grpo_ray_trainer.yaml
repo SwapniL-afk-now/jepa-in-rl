@@ -14,15 +14,19 @@ jepa:
   ema_decay: 0.99
   max_grad_norm: 0.5
   embed_micro_batch_size: 16
+  # Max tokens of the [x, y^+] teacher target encoded per no-grad forward.
+  # 0 => fall back to data.max_prompt_length + data.max_response_length.
+  target_max_length: 0
   min_valid_pairs: 2
   n_projections: 1024
   t_min: -5.0
   t_max: 5.0
   epps_pulley_s: 1.0
   code_system_prompt: "You are a Python programming expert. Solve the following math problem by writing a complete, executable Python program that prints the answer."
-  loss_type: jepa-tcr-dual     # only supported ray/worker objective
+  loss_type: jepa-tcr-dual     # jepa-tcr-dual | jepa-tcr-cot | cc-jepa
   predictor_k: 0
-  triplet_sigreg_lambda: 0.05  # SIGReg lambda for the jepa-tcr-dual loss
+  triplet_sigreg_lambda: 0.05  # SIGReg lambda; also used by cc-jepa's (1-λ)*CC-align + λ*SIGReg
+  cc_tau: 0.5                  # cc-jepa latent correctness scale: P(y=1|d) = exp(-d/tau)
   # -- jepa-tcr-dual teacher caches --
   teacher_cache_path: ""       # .pt of {dataset_index: (n_i,d)} teacher-correct targets
   n_targets_per_q: 4           # cap of cached targets used per question

@@ -35,6 +35,7 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from verl.experimental.jepa_grpo.config_ray import JEPARayConfig
 from verl.experimental.jepa_grpo.core_algos import (
+    cc_jepa_loss,
     llm_jepa_tcr_dual_loss,
 )
 
@@ -738,9 +739,9 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
         """
         assert self.jepa_cfg is not None, "Call jepa_init() before jepa_update()"
         assert self.ema_weights is not None, "EMA not initialised"
-        assert self.jepa_cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot"), (
-            f"worker.jepa_update only supports loss_type 'jepa-tcr-dual' or "
-            f"'jepa-tcr-cot', got {self.jepa_cfg.loss_type!r}"
+        assert self.jepa_cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot", "cc-jepa"), (
+            f"worker.jepa_update only supports loss_type 'jepa-tcr-dual', "
+            f"'jepa-tcr-cot' or 'cc-jepa', got {self.jepa_cfg.loss_type!r}"
         )
         if self.jepa_cfg.predictor_k > 0:
             assert self.jepa_cfg.predictor_token_id >= 0, (
@@ -802,7 +803,7 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
             # `*_lengths == 0` marking padding rows (see ray_trainer builders) —
             # filter those out before the joint forward so only real rows are
             # encoded. The joint forward + loss differ per loss_type below.
-            if cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot"):
+            if cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot", "cc-jepa"):
                 # Dual-target self-consistent TCR ('jepa-tcr-cot' is the same path with
                 # an empty code arm: is_code all-False, self_mask all-False, so the loss
                 # degrades to align_cot + SIGReg(pred_cot)).
@@ -881,6 +882,52 @@ class JEPAActorRolloutRefWorker(ActorRolloutRefWorker):
                 cot_rows = cot_sel.nonzero(as_tuple=True)[0]
                 n_cot = int(cot_rows.numel())
                 n_code = int(code_abs.numel())
+
+                if cfg.loss_type == "cc-jepa":
+                    assert is_correct is not None, (
+                        "cc-jepa requires anchor_is_correct in the JEPA batch "
+                        "(built by ray_trainer with jepa_anchor_set='all')"
+                    )
+                    # CC-JEPA: L = (1-lambda)*L_CC-align + lambda*L_SIGReg. All rows
+                    # are CoT (config forbids n_code>0); correct rollouts pull toward
+                    # z^+, incorrect rollouts push away (CC-align, replaces the old
+                    # align_cot term); SIGReg runs over the full pool (correct+wrong,
+                    # since anchor_set='all') for anti-collapse, unchanged in kind
+                    # from llm_jepa_tcr_dual_loss. No self/code arms. The auto-off
+                    # cot-arm latch gates the whole term (align_cot_on=0 -> zero loss,
+                    # so the deferred policy grad still gets its fused optimizer step).
+                    def _loss_fn(joint_emb, boundary, _tt=teacher_target,
+                                 _ic=is_correct, _on=align_cot_on):
+                        dev, dt = joint_emb.device, joint_emb.dtype
+                        loss, m = cc_jepa_loss(
+                            pred=joint_emb,
+                            teacher_target=_tt.to(device=dev, dtype=dt),
+                            is_correct=_ic.to(dev),
+                            tau=cfg.cc_tau,
+                            lambda_=cfg.triplet_sigreg_lambda,
+                            M=cfg.n_projections,
+                            t_min=cfg.t_min, t_max=cfg.t_max, s=cfg.epps_pulley_s,
+                        )
+                        if not _on:
+                            loss = loss * 0.0
+                        m["jepa/arm_cot_on"] = float(_on)
+                        return loss, m
+
+                    jepa_metrics = self._embed_chunked_with_backward(
+                        anchor_ids, anchor_mask, anchor_lengths, joint_predictor_k,
+                        _loss_fn, micro_bs, alpha, also_boundary=True,
+                    )
+                    grad_norm = engine.optimizer_step(clip_grad_override=self.jepa_cfg.max_grad_norm)
+                    self._sync_ema()
+                    aggressive_empty_cache(force_sync=True)
+                    out = {
+                        "jepa/total_loss": torch.tensor(float(jepa_metrics.get("jepa/cc_loss", 0.0))),
+                        "jepa/n_valid_pairs": torch.tensor(float(n_pairs)),
+                        "jepa/skipped": torch.tensor(0.0),
+                        "jepa/grad_norm": torch.tensor(float(grad_norm) if grad_norm is not None else 0.0),
+                    }
+                    out.update({k: torch.tensor(float(v)) for k, v in jepa_metrics.items()})
+                    return TensorDict(out, batch_size=[])
 
                 def _loss_fn(joint_emb, boundary, _cot=cot_sel, _code=is_code,
                              _tt=teacher_target, _gid=group_id, _ic=is_correct,

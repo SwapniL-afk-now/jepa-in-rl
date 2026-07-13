@@ -165,6 +165,13 @@ class JEPARayConfig:
     # SIGReg lambda for the jepa-tcr-dual loss: L = (1-λ)·(align_cot + align_code +
     # w·L_self) + λ·SIGReg([pred_cot, pred_code]). (Name retained for config back-compat.)
     triplet_sigreg_lambda: float = 0.05
+    # -- cc-jepa only --
+    # Latent correctness scale tau of CC-JEPA: P(y=1|d) = exp(-d/tau) with
+    # d = 1 - cos(pred, z^+) in [0, 2]. Smaller tau = sharper correct/incorrect
+    # separation in latent space. Uses the SAME triplet_sigreg_lambda above for
+    # its (1-lambda)*CC-align + lambda*SIGReg mix (SIGReg over the full
+    # correct+wrong pool, since cc-jepa requires jepa_anchor_set='all').
+    cc_tau: float = 0.5
 
     @classmethod
     def from_config(cls, config: DictConfig | dict | None) -> "JEPARayConfig":
@@ -183,9 +190,9 @@ class JEPARayConfig:
         """
         if not self.enable:
             return
-        if self.loss_type not in ("jepa-tcr-dual", "jepa-tcr-cot"):
+        if self.loss_type not in ("jepa-tcr-dual", "jepa-tcr-cot", "cc-jepa"):
             raise ValueError(
-                f"jepa.loss_type must be 'jepa-tcr-dual' or 'jepa-tcr-cot'; "
+                f"jepa.loss_type must be 'jepa-tcr-dual', 'jepa-tcr-cot' or 'cc-jepa'; "
                 f"got {self.loss_type!r}"
             )
         if not self.teacher_cache_path:
@@ -204,10 +211,19 @@ class JEPARayConfig:
                 "precompute_teacher_targets.py --view code; z^+ is recomputed online). "
                 "Use loss_type='jepa-tcr-cot' for CoT-only training with no code cache."
             )
-        if self.loss_type == "jepa-tcr-cot" and self.n_code > 0:
+        if self.loss_type in ("jepa-tcr-cot", "cc-jepa") and self.n_code > 0:
             raise ValueError(
-                f"jepa.loss_type='jepa-tcr-cot' is CoT-only; set n_code=0 (got {self.n_code})."
+                f"jepa.loss_type={self.loss_type!r} is CoT-only; set n_code=0 (got {self.n_code})."
             )
+        # CC-JEPA's whole point is using incorrect rollouts as negative views; with
+        # anchor_set='correct' it silently degrades to plain LLM-JEPA (all y_i=1).
+        if self.loss_type == "cc-jepa" and self.jepa_anchor_set != "all":
+            raise ValueError(
+                f"jepa.loss_type='cc-jepa' requires jepa.jepa_anchor_set='all' "
+                f"(incorrect rollouts are the negative views); got {self.jepa_anchor_set!r}"
+            )
+        if self.loss_type == "cc-jepa" and self.cc_tau <= 0:
+            raise ValueError(f"jepa.cc_tau must be > 0; got {self.cc_tau}")
         if self.tcr_match not in ("cycle", "random"):
             raise ValueError(f"jepa.tcr_match must be 'cycle' or 'random'; got {self.tcr_match!r}")
         if self.jepa_anchor_set not in ("correct", "all", "wrong"):

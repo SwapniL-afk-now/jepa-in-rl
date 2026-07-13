@@ -66,7 +66,10 @@ export WANDB_SILENT=${WANDB_SILENT:-true}
 export WANDB_MODE=${WANDB_MODE:-online}
 
 ########################### user-adjustable ###########################
-MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-3B-Instruct}
+# yarn64k = milder static yarn (factor 2, 32k->64k). The factor-4 yarn131k
+# variant degraded short-context accuracy badly (~25% -> ~7% at step 1);
+# plain model (native 32k) is the safe fallback if 64k also underperforms.
+MODEL_PATH=${MODEL_PATH:-/workspace/models/Qwen2.5-3B-Instruct-yarn64k}
 TRAIN_FILE=${TRAIN_FILE:-/workspace/jepa-grpo-cache/data/dapo_math_17k_train.parquet}
 NNODES=${NNODES:-1}
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-2}
@@ -139,8 +142,8 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-${TRAIN_PROMPT_BATCH_SIZE}}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-3072}   # 3072-token generation budget; shared by train + eval via data.max_response_length
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}   # 65536 OOM'd during actor backward; activation memory, not just optimizer state, scales with this
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-16384}   # 16k-token generation budget; shared by train + eval via data.max_response_length
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-20480}   # must be >= max_prompt+max_response (17408) for dynamic bsz; 65536 OOM'd during actor backward
 ACTOR_ATTENTION_IMPL=${ACTOR_ATTENTION_IMPL:-flash_attention_2}
 DAPO_USE_LORA=${DAPO_USE_LORA:-true}   # false -> full fine-tuning; set true to re-enable LoRA
 LORA_RANK=${LORA_RANK:-512}
@@ -191,7 +194,7 @@ ALPHA_WARMUP_STEPS=${ALPHA_WARMUP_STEPS:-0}
 # Canonical DAPO uses a buffer of ~20% of max_response_length (official recipe: 4096/20480),
 # with the penalty ramping linearly from 0 to penalty_factor over that final window.
 ENABLE_OVERLONG_BUFFER=${ENABLE_OVERLONG_BUFFER:-false}   # Dr.GRPO: no overlong length penalty
-OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-614}          # ~20% of MAX_RESPONSE_LENGTH=3072 (matches DAPO's 4096/20480 ratio)
+OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-3277}          # ~20% of MAX_RESPONSE_LENGTH=16384 (matches DAPO's 4096/20480 ratio)
 OVERLONG_PENALTY_FACTOR=${OVERLONG_PENALTY_FACTOR:-1.0}
 
 # DAPO dynamic sampling (group filtering). Canonical DAPO oversamples the generation
@@ -225,7 +228,7 @@ VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-8}    # halved vs. 1.5B to bound val-time rollout
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-128}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
-VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[31415,27182,16180]'}
+VALIDATION_SEEDS=${VALIDATION_SEEDS:-'[42,1234,9973]'}
 VAL_TOP_P=${VAL_TOP_P:-0.95}
 
 MAX_OPTIMIZER_STEPS=${MAX_OPTIMIZER_STEPS:-800}   # fixed-length run on dapo-math-17k
@@ -234,7 +237,7 @@ TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}   # skip the step-0 pre-train validation; go straight into training
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}   # only the most recent checkpoint is kept on disk
 
-PROJECT_NAME=${PROJECT_NAME:-dapo_deepseek_1.5B}
+PROJECT_NAME=${PROJECT_NAME:-grpo-qwen-3b}
 export WANDB_ENTITY=${WANDB_ENTITY:-ismamnurswapnil-bangladesh-university-of-engineering-and}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}
 MODEL_NAME=${MODEL_NAME:-$(basename "${MODEL_PATH}")}
@@ -318,6 +321,7 @@ ACTOR=(
     actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS}
     actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF}
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
+    actor_rollout_ref.actor.data_loader_seed=${TRAIN_SEED:-31415}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 )
@@ -416,7 +420,7 @@ EXTRA=(
     actor_rollout_ref.model.use_fused_kernels=True
     actor_rollout_ref.model.fused_kernel_options.impl_backend=triton
     actor_rollout_ref.rollout.max_num_batched_tokens=16384
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=auto
     +actor_rollout_ref.actor.fuse_old_log_prob=True
 )
 

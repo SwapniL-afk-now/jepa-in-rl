@@ -2229,18 +2229,28 @@ class RayPPOTrainer:
         if error is not None:
             raise error
 
-    def _tafr_collect_failures(self, batch: DataProto, reward_tensor: torch.Tensor) -> int:
+    def _tafr_collect_failures(
+        self, batch: DataProto, reward_tensor: torch.Tensor, reward_extra_infos_dict: Optional[dict] = None
+    ) -> int:
         if not self.tafr_enabled or self.tafr_failure_collector is None:
             return 0
         rewards = reward_tensor.sum(dim=-1).detach().cpu().float().tolist()
+        # Prefer the correctness metric when the reward manager provides it (same
+        # preference _filter_dapo_groups uses): under DAPO's overlong penalty a
+        # correct-but-long answer has reward <= 0 and must NOT be SFT'd as wrong.
+        acc = (reward_extra_infos_dict or {}).get("acc")
+        if acc is not None and len(acc) == len(rewards):
+            correctness = [float(v) for v in acc]
+        else:
+            correctness = rewards
         prompts = batch.batch["prompts"].detach().cpu()
         responses = batch.batch["responses"].detach().cpu()
         response_mask = batch.batch["response_mask"].detach().cpu()
         uids = [str(uid) for uid in batch.non_tensor_batch.get("uid", [""] * len(rewards))]
 
         collected = 0
-        for i, reward in enumerate(rewards):
-            if float(reward) > 0.0:
+        for i, correct in enumerate(correctness):
+            if float(correct) > 0.0:
                 continue
             response_len = int(response_mask[i].sum().item())
             prompt_text = self.tokenizer.decode(prompts[i], skip_special_tokens=True)
@@ -2480,6 +2490,12 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        # Collect failure-SFT data BEFORE the DAPO group filter: the filter
+                        # drops all-wrong groups, which are exactly the wrong responses the
+                        # TAFR replay model must be trained on.
+                        tafr_wrong_collected = self._tafr_collect_failures(
+                            batch, reward_tensor, reward_extra_infos_dict
+                        )
                         batch, reward_tensor, reward_extra_infos_dict, dapo_filter_metrics = self._filter_dapo_groups(
                             batch, reward_tensor, reward_extra_infos_dict
                         )
@@ -2488,7 +2504,6 @@ class RayPPOTrainer:
                             batch.meta_info["global_token_num"] = torch.sum(
                                 batch.batch["attention_mask"], dim=-1
                             ).tolist()
-                        tafr_wrong_collected = self._tafr_collect_failures(batch, reward_tensor)
 
                     # TAFR anchor/replay log-prob scoring, ordered around the vLLM sleep:
                     #   - vLLM backend: score NOW, while the engine is still awake from gen
@@ -2518,6 +2533,48 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    # Fused path: when the update is a single on-policy optimizer step
+                    # (ppo_epochs==1 and ppo_mini_batch_size >= train_batch_size), the
+                    # old log-probs equal the log-probs the update forward recomputes on
+                    # the same weights, so the PPO ratio is identically 1.0. Skip the
+                    # whole extra forward over all rollout tokens and let the loss
+                    # default old_log_prob = log_prob.detach() (see workers/utils/losses.py).
+                    # Disabled whenever anything downstream consumes old_log_probs.
+                    actor_cfg = self.config.actor_rollout_ref.actor
+                    fuse_old_log_prob = bool(actor_cfg.get("fuse_old_log_prob", False))
+                    if fuse_old_log_prob:
+                        _fuse_blockers = []
+                        if int(actor_cfg.ppo_epochs) != 1:
+                            _fuse_blockers.append(f"ppo_epochs={actor_cfg.ppo_epochs} != 1")
+                        # Check the ACTUAL (post-DAPO-filter) batch against one mini-batch:
+                        # if the batch spans multiple mini-batches (e.g. the filter's
+                        # no-mixed-groups fallback returns the unfiltered gen_batch_size
+                        # oversample), fusing would run several optimizer steps with
+                        # ratio==1 against already-updated weights, which is invalid.
+                        _mini_batch_rows = int(actor_cfg.ppo_mini_batch_size) * int(
+                            self.config.actor_rollout_ref.rollout.n
+                        )
+                        if len(batch) > _mini_batch_rows:
+                            _fuse_blockers.append(
+                                f"batch rows ({len(batch)}) > one mini-batch "
+                                f"({actor_cfg.ppo_mini_batch_size} prompts x rollout.n = {_mini_batch_rows} rows)"
+                            )
+                        if rollout_corr_config:
+                            _fuse_blockers.append("algorithm.rollout_correction is set")
+                        if self.config.algorithm.use_kl_in_reward:
+                            _fuse_blockers.append("algorithm.use_kl_in_reward=true")
+                        if actor_cfg.get("calculate_sum_pi_squared", False) or self.config.algorithm.adv_estimator in (
+                            AdvantageEstimator.OPTIMAL_TOKEN_BASELINE,
+                            AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE,
+                        ):
+                            _fuse_blockers.append("advantage estimator needs old_log_probs/sum_pi_squared")
+                        if _fuse_blockers:
+                            print(
+                                "[fuse_old_log_prob] disabled: " + "; ".join(_fuse_blockers) + "; "
+                                "falling back to a separate old_log_prob forward.",
+                                flush=True,
+                            )
+                            fuse_old_log_prob = False
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -2526,6 +2583,11 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
+                    elif fuse_old_log_prob:
+                        # No old_log_prob forward; ratio == 1 exactly in the actor loss.
+                        # Note: the actor/entropy metric comes from this pass; set
+                        # actor.calculate_entropy=true to keep it in fused mode.
+                        pass
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -2559,7 +2621,9 @@ class RayPPOTrainer:
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    assert fuse_old_log_prob or "old_log_probs" in batch.batch, (
+                        f'"old_log_prob" not in {batch.batch.keys()=}'
+                    )
 
                     if self.use_reference_policy:
                         # compute reference log_prob

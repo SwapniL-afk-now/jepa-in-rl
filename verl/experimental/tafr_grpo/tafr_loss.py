@@ -81,12 +81,15 @@ def compute_tafr_grpo_auxiliary_loss(
     anchor_loss = zero
     replay_loss = zero
 
-    anchor_kl_metric = 0.0
-    replay_kl_metric = 0.0
-    actor_lp_metric = 0.0
-    anchor_lp_metric = 0.0
-    replay_lp_metric = 0.0
-    actor_lp_on_replay_metric = 0.0
+    # Metric scalars stay on-device; a single stacked .cpu() transfer at the
+    # end replaces one GPU sync per metric per micro-batch.
+    scalar_zero = zero.detach()
+    anchor_kl_metric = scalar_zero
+    replay_kl_metric = scalar_zero
+    actor_lp_metric = scalar_zero
+    anchor_lp_metric = scalar_zero
+    replay_lp_metric = scalar_zero
+    actor_lp_on_replay_metric = scalar_zero
 
     if variant in {"full", "anchor_only"} and anchor_log_prob is not None:
         frozen_anchor = anchor_log_prob.to(device=log_prob.device, dtype=log_prob.dtype).detach()
@@ -95,9 +98,9 @@ def compute_tafr_grpo_auxiliary_loss(
         r_anchor = torch.exp(log_ratio_anchor)
         anchor_seq_kl = response_length_normalized_mean(((r_anchor - 1) - log_ratio_anchor).clamp(min=-10, max=10), response_mask)
         anchor_loss = _group_mean(anchor_seq_kl, group_ids)
-        anchor_kl_metric = float(anchor_seq_kl.detach().mean().cpu())
-        actor_lp_metric = float(response_length_normalized_mean(log_prob.detach(), response_mask).mean().cpu())
-        anchor_lp_metric = float(response_length_normalized_mean(frozen_anchor, response_mask).mean().cpu())
+        anchor_kl_metric = anchor_seq_kl.detach().mean()
+        actor_lp_metric = response_length_normalized_mean(log_prob.detach(), response_mask).mean()
+        anchor_lp_metric = response_length_normalized_mean(frozen_anchor, response_mask).mean()
 
     if variant in {"full", "replay_only"} and replay_log_prob is not None:
         frozen_replay = replay_log_prob.to(device=log_prob.device, dtype=log_prob.dtype).detach()
@@ -107,30 +110,31 @@ def compute_tafr_grpo_auxiliary_loss(
         replay_seq_kl = response_length_normalized_mean(((r_replay - 1) - log_ratio_replay).clamp(min=-10, max=10), response_mask)
         gated_replay_seq_kl = gate * replay_seq_kl
         replay_loss = _group_mean(gated_replay_seq_kl, group_ids)
-        replay_kl_metric = float(replay_seq_kl.detach().mean().cpu())
-        replay_lp_metric = float(response_length_normalized_mean(frozen_replay, response_mask).mean().cpu())
-        actor_lp_on_replay_metric = float(response_length_normalized_mean(log_prob.detach(), response_mask).mean().cpu())
+        replay_kl_metric = replay_seq_kl.detach().mean()
+        replay_lp_metric = response_length_normalized_mean(frozen_replay, response_mask).mean()
+        actor_lp_on_replay_metric = response_length_normalized_mean(log_prob.detach(), response_mask).mean()
 
     loss = float(beta) * anchor_loss - float(beta) * replay_loss
     group_reward_mean_d = group_reward_mean.detach()
 
-    metrics = {
-        "tafr_grpo/loss_total": float(loss.detach().cpu()),
+    scalars = {
+        "tafr_grpo/loss_total": loss.detach(),
         "tafr_grpo/kl_anchor": anchor_kl_metric,
         "tafr_grpo/kl_replay": replay_kl_metric,
-        "tafr_grpo/replay_gate_mean": float(gate.detach().mean().cpu()),
-        "tafr_grpo/mean_group_reward": float(group_reward_mean_d.mean().cpu()),
-        "tafr_grpo/fraction_all_wrong_groups": float((group_reward_mean_d == 0).float().mean().cpu()),
-        "tafr_grpo/fraction_all_correct_groups": float((group_reward_mean_d == 1).float().mean().cpu()),
-        "tafr_grpo/fraction_mixed_groups": float(
-            ((group_reward_mean_d > 0) & (group_reward_mean_d < 1)).float().mean().cpu()
-        ),
-        "tafr_grpo/beta": float(beta),
+        "tafr_grpo/replay_gate_mean": gate.detach().mean(),
+        "tafr_grpo/mean_group_reward": group_reward_mean_d.mean(),
+        "tafr_grpo/fraction_all_wrong_groups": (group_reward_mean_d == 0).float().mean(),
+        "tafr_grpo/fraction_all_correct_groups": (group_reward_mean_d == 1).float().mean(),
+        "tafr_grpo/fraction_mixed_groups": ((group_reward_mean_d > 0) & (group_reward_mean_d < 1)).float().mean(),
     }
     if variant in {"full", "anchor_only"}:
-        metrics["tafr_grpo/actor_logprob"] = actor_lp_metric
-        metrics["tafr_grpo/anchor_logprob"] = anchor_lp_metric
+        scalars["tafr_grpo/actor_logprob"] = actor_lp_metric
+        scalars["tafr_grpo/anchor_logprob"] = anchor_lp_metric
     if variant in {"full", "replay_only"}:
-        metrics["tafr_grpo/replay_logprob"] = replay_lp_metric
-        metrics["tafr_grpo/actor_logprob_on_replay_samples"] = actor_lp_on_replay_metric
+        scalars["tafr_grpo/replay_logprob"] = replay_lp_metric
+        scalars["tafr_grpo/actor_logprob_on_replay_samples"] = actor_lp_on_replay_metric
+
+    stacked = torch.stack([value.float() for value in scalars.values()]).cpu()
+    metrics = {key: float(value) for key, value in zip(scalars, stacked)}
+    metrics["tafr_grpo/beta"] = float(beta)
     return TAFRLossOutput(loss=loss, metrics=metrics)

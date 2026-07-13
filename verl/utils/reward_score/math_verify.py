@@ -39,7 +39,7 @@ def _get_pool():
     return _pool
 
 
-def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> float:
+def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> tuple[float, str]:
     """Run math_verify in a subprocess where signal.alarm() works."""
     from math_verify.grader import verify
     from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
@@ -49,19 +49,30 @@ def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> float:
 
     extracted_gold = parse(ground_truth_boxed, gold_targets)
     extracted_pred = parse(model_output, pred_targets)
+    pred_str = str(extracted_pred[0]) if extracted_pred else "<unparsed>"
     if extracted_gold and extracted_pred:
-        return max(1.0 if any(verify(g, p) for g in extracted_gold) else 0.0 for p in extracted_pred)
-    return 0.0
+        score = max(1.0 if any(verify(g, p) for g in extracted_gold) else 0.0 for p in extracted_pred)
+        return score, pred_str
+    return 0.0, pred_str
 
 
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0, timeout: float = 30.0) -> float:
-    ret_score = 0.0
+    return compute_score_with_pred(model_output, ground_truth, timeout_score, timeout)[0]
+
+
+def compute_score_with_pred(
+    model_output: str, ground_truth: str, timeout_score: float = 0, timeout: float = 30.0
+) -> tuple[float, str]:
+    """Same as compute_score, but also returns Math-Verify's extracted/normalized
+    prediction string — used for exploration-diversity metrics (unique_answer_ratio_at_k
+    etc.) that need to compare predictions across a group, not just correctness."""
+    ret_score, pred_str = 0.0, "<unparsed>"
     ground_truth_boxed = "\\boxed{" + ground_truth + "}"
     try:
         future = _get_pool().submit(_verify_in_subprocess, ground_truth_boxed, model_output)
-        ret_score = future.result(timeout=timeout)
+        ret_score, pred_str = future.result(timeout=timeout)
     except (FuturesTimeoutError, TimeoutException):
         ret_score = timeout_score
     except Exception as e:
         print(f"Error in math_verify compute_score: {e}")
-    return ret_score
+    return ret_score, pred_str

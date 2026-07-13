@@ -81,7 +81,15 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # (global) latches True only once EVERY tracked signal is off, at which point the
         # whole JEPA block is skipped to save the forward.
         self._jepa_signal_off = False
-        self._off_arm: dict[str, bool] = {k: False for k in ("cot", "code", "self", "shaping", "global")}
+        # "cot_wrong" (cc-jepa only): tracks the wrong-anchor repulsion (jepa/d_wrong,
+        # higher=better i.e. more separated) SEPARATELY from "cot" (jepa/cos_cot,
+        # correct-anchor alignment). Since anchor_set='all' means the single CC-JEPA
+        # loss term does both jobs at once, gating its shutoff on cos_cot alone would
+        # also silence the still-improving wrong-repulsion the moment correct-alignment
+        # plateaus — the two forces have different gradient shapes (constant vs
+        # self-attenuating) and are not guaranteed to plateau together. See where
+        # align_cot_on is set below: for cc-jepa it requires BOTH arms off.
+        self._off_arm: dict[str, bool] = {k: False for k in ("cot", "cot_wrong", "code", "self", "shaping", "global")}
         self._align_best: dict[str, float] = {k: float("-inf") for k in self._off_arm}
         self._align_stall: dict[str, int] = {k: 0 for k in self._off_arm}
 
@@ -521,7 +529,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         Returns None if fewer than min_valid_pairs CoT anchors exist.
         """
         assert self.teacher_targets is not None, "CoT teacher target cache not loaded"
-        cot_only = self.jepa_cfg.loss_type == "jepa-tcr-cot"
+        cot_only = self.jepa_cfg.loss_type in ("jepa-tcr-cot", "cc-jepa")
         assert cot_only or self.code_teacher_targets is not None, "Code teacher target cache not loaded"
         uids = batch.non_tensor_batch["uid"]
         extra_infos = batch.non_tensor_batch["extra_info"]
@@ -614,7 +622,7 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         # CoT-only mode has no code arm (A_k==0 by construction); dual requires both.
         if A_c < self.jepa_cfg.min_valid_pairs:
             return None
-        if A_k == 0 and self.jepa_cfg.loss_type != "jepa-tcr-cot":
+        if A_k == 0 and self.jepa_cfg.loss_type not in ("jepa-tcr-cot", "cc-jepa"):
             return None
 
         # Concatenate the two sub-blocks (CoT first) into one padded block.
@@ -877,6 +885,11 @@ class JEPARayPPOTrainer(RayPPOTrainer):
         signals = []
         if self.jepa_cfg.n_cot > 0:
             signals.append(("cot", "jepa/cos_cot"))
+        # cc-jepa: also track wrong-anchor separation (d_wrong, higher=better)
+        # independently of correct-anchor alignment (cos_cot) — see the comment
+        # on self._off_arm in __init__.
+        if self.jepa_cfg.loss_type == "cc-jepa" and self.jepa_cfg.n_cot > 0:
+            signals.append(("cot_wrong", "jepa/d_wrong"))
         if self.jepa_cfg.n_code > 0:
             signals.append(("code", "jepa/cos_code"))
         if self.jepa_cfg.n_cot > 0 and self.jepa_cfg.n_code > 0:
@@ -1369,10 +1382,20 @@ class JEPARayPPOTrainer(RayPPOTrainer):
                             )
                             # Per-arm plateau latches -> worker zeroes the disabled align
                             # term's gradient (preds still feed SIGReg). dual mode only.
-                            if self.jepa_cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot"):
+                            if self.jepa_cfg.loss_type in ("jepa-tcr-dual", "jepa-tcr-cot", "cc-jepa"):
                                 _bs = jepa_td.batch_size[0]
-                                _cot_only = self.jepa_cfg.loss_type == "jepa-tcr-cot"
-                                jepa_td["align_cot_on"] = torch.full((_bs,), float(not self._off_arm["cot"]))
+                                _cot_only = self.jepa_cfg.loss_type in ("jepa-tcr-cot", "cc-jepa")
+                                # cc-jepa's single loss term does both correct-pull AND
+                                # wrong-push; only zero it once BOTH the "cot" (cos_cot)
+                                # and "cot_wrong" (d_wrong) arms have individually
+                                # plateaued (see _tracked_signals / __init__ comment).
+                                # Other loss_types are unaffected: "cot_wrong" is never
+                                # tracked/latched for them, so it stays False forever and
+                                # this reduces to the old single-arm check.
+                                _cot_arm_off = self._off_arm["cot"] and (
+                                    self._off_arm["cot_wrong"] if self.jepa_cfg.loss_type == "cc-jepa" else True
+                                )
+                                jepa_td["align_cot_on"] = torch.full((_bs,), float(not _cot_arm_off))
                                 # CoT-only mode has no code / self-consistency arms.
                                 jepa_td["align_code_on"] = torch.full((_bs,), 0.0 if _cot_only else float(not self._off_arm["code"]))
                                 jepa_td["self_on"] = torch.full((_bs,), 0.0 if _cot_only else float(not self._off_arm["self"]))

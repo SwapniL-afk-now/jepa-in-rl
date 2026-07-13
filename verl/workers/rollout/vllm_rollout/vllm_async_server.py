@@ -212,6 +212,11 @@ class vLLMHttpServer:
             method="load_tafr_lora_adapter",
             kwargs={"adapter": adapter, "peft_config": peft_config, "lora_tensors_pkl": pickle.dumps(lora_tensors)},
         )
+        # Cache the loaded slot so score_tafr_logprobs skips a per-request
+        # list_loras() engine RPC (one per scored sequence otherwise).
+        if not hasattr(self, "_tafr_loaded_lora_ids"):
+            self._tafr_loaded_lora_ids = set()
+        self._tafr_loaded_lora_ids.add(tafr_vllm_adapter_spec(adapter).int_id)
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -611,8 +616,14 @@ class vLLMHttpServer:
             return []
         sequence_ids = normalize_token_ids(sequence_ids)
         spec = tafr_vllm_adapter_spec(adapter)
-        if spec.int_id not in await self.engine.list_loras():
-            raise RuntimeError(f"TAFR vLLM scoring adapter {adapter!r} (int_id={spec.int_id}) is not loaded.")
+        loaded_ids = getattr(self, "_tafr_loaded_lora_ids", set())
+        if spec.int_id not in loaded_ids:
+            # Cache miss (e.g. adapter loaded before this attribute existed):
+            # fall back to the engine RPC once and refresh the cache.
+            engine_ids = set(await self.engine.list_loras())
+            if spec.int_id not in engine_ids:
+                raise RuntimeError(f"TAFR vLLM scoring adapter {adapter!r} (int_id={spec.int_id}) is not loaded.")
+            self._tafr_loaded_lora_ids = loaded_ids | engine_ids
         if len(sequence_ids) > self.config.max_model_len:
             raise ValueError(
                 f"Sequence length ({len(sequence_ids)}) exceeds max_model_len ({self.config.max_model_len})."

@@ -67,15 +67,18 @@ def default_compute_score(
         "deepscaler-preview-dataset",
         "minervamath",
     ] or data_source.startswith("aime"):
-        from verl.experimental.fepo.math_parser import compute_math_reward
+        # Swapped from the hand-rolled fepo regex parser to Math-Verify (the
+        # actual pip library, sympy-backed LaTeX-aware equivalence checking)
+        # for both training and validation. Same -1/+1 score convention as
+        # before so GRPO/DAPO advantage + overlong-penalty scaling is unaffected.
+        from . import math_verify
 
-        parsed = compute_math_reward(solution_str, ground_truth, dataset_kind=data_source)
+        score, pred = math_verify.compute_score_with_pred(solution_str, ground_truth)
+        is_correct = bool(score)
         res = {
-            "score": 1.0 if parsed.is_correct else -1.0,
-            "acc": parsed.is_correct,
-            "pred": parsed.prediction_normalized,
-            "has_parseable_answer": parsed.has_parseable_answer,
-            "ground_truth_normalized": parsed.ground_truth_normalized,
+            "score": 1.0 if is_correct else -1.0,
+            "acc": is_correct,
+            "pred": pred,
         }
     elif data_source in [
         "numina_aops_forum",
